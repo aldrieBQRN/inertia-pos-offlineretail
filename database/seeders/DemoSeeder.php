@@ -47,13 +47,14 @@ class DemoSeeder extends Seeder
 
         $this->command?->info("  ✓ Store created (ID: {$storeId})");
 
-        // ── 2. Users ─────────────────────────────────────────────────────────
+        // ── 2. Users (PIN-based authentication for standalone POS) ───────────
+        // Default Admin PIN: 1234
         DB::table('users')->insert([
             [
                 'name'             => 'Admin User',
                 'email'            => 'admin@demo.com',
-                'password'         => Hash::make('demo1234'),
-                'auth_type'        => 'password',
+                'password'         => Hash::make('1234'),
+                'auth_type'        => 'pin4',
                 'role'             => 'admin',
                 'is_admin'         => true,
                 'store_id'         => $storeId,
@@ -66,8 +67,8 @@ class DemoSeeder extends Seeder
             [
                 'name'             => 'Jane Cashier',
                 'email'            => 'cashier@demo.com',
-                'password'         => Hash::make('demo1234'),
-                'auth_type'        => 'password',
+                'password'         => Hash::make('1234'),
+                'auth_type'        => 'pin4',
                 'role'             => 'cashier',
                 'is_admin'         => false,
                 'store_id'         => $storeId,
@@ -79,7 +80,7 @@ class DemoSeeder extends Seeder
             ],
         ]);
 
-        $this->command?->info("  ✓ Users created (admin + cashier)");
+        $this->command?->info("  ✓ Users created (Admin PIN: 1234)");
 
         // ── 3. Categories ────────────────────────────────────────────────────
         $categoryData = [
@@ -108,7 +109,6 @@ class DemoSeeder extends Seeder
         $this->command?->info("  ✓ Categories created (" . count($categoryData) . ")");
 
         // ── 4. Products (price & cost_price stored in cents) ─────────────────
-        // [name, category, price_pesos, cost_pesos, stock, sku]
         $products = [
             // Fresh Produce
             ['Red Apple (kg)',       'Fresh Produce',  350,  200,  50, 'PROD-001'],
@@ -173,8 +173,7 @@ class DemoSeeder extends Seeder
         $this->command?->info('');
         $this->command?->info('🎉 Demo seeding complete!');
         $this->command?->info('');
-        $this->command?->info('🔑 Login credentials:');
-        $this->command?->info('   Admin   → admin@demo.com   / demo1234');
-        $this->command?->info('   Cashier → cashier@demo.com / demo1234');
+        $this->command?->info('🔑 Login credential:');
+        $this->command?->info('   PIN → 1234');
     }
 }
