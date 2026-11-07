@@ -10,18 +10,6 @@ use Carbon\Carbon;
 
 /**
  * DemoSeeder — Seeds realistic demo data for the InfinityFree live demo.
- *
- * Run via web:
- *   https://yourdomain.com/migrate.php?token=TOKEN&action=seed
- *
- * Or locally:
- *   php artisan db:seed --class=DemoSeeder
- *
- * Creates:
- *  - 1 store (Demo Retail Store)
- *  - 2 users: admin + cashier
- *  - 6 categories, 24 products
- *  - 1 completed shift with sample sales
  */
 class DemoSeeder extends Seeder
 {
@@ -91,23 +79,9 @@ class DemoSeeder extends Seeder
             ],
         ]);
 
-        $adminId   = DB::table('users')->where('email', 'admin@demo.com')->value('id');
-        $cashierId = DB::table('users')->where('email', 'cashier@demo.com')->value('id');
-
         $this->command?->info("  ✓ Users created (admin + cashier)");
 
-        // ── 3. Settings ──────────────────────────────────────────────────────
-        if (Schema::hasTable('settings')) {
-            DB::table('settings')->insert([
-                'store_id'   => $storeId,
-                'key'        => 'currency',
-                'value'      => 'PHP',
-                'created_at' => $now,
-                'updated_at' => $now,
-            ]);
-        }
-
-        // ── 4. Categories ────────────────────────────────────────────────────
+        // ── 3. Categories ────────────────────────────────────────────────────
         $categoryData = [
             ['Fresh Produce', '#22c55e'],
             ['Meat & Seafood', '#ef4444'],
@@ -133,175 +107,68 @@ class DemoSeeder extends Seeder
 
         $this->command?->info("  ✓ Categories created (" . count($categoryData) . ")");
 
-        // ── 5. Products ──────────────────────────────────────────────────────
-        // Format: [name, category, price, cost, stock]
+        // ── 4. Products (price & cost_price stored in cents) ─────────────────
+        // [name, category, price_pesos, cost_pesos, stock, sku]
         $products = [
             // Fresh Produce
-            ['Red Apple (kg)',       'Fresh Produce',  350,  200,  50],
-            ['Banana (Bunch)',       'Fresh Produce',  250,  150,  45],
-            ['Carrots (500g)',       'Fresh Produce',  180,   90,  60],
-            ['Potatoes (kg)',        'Fresh Produce',  220,  100, 100],
+            ['Red Apple (kg)',       'Fresh Produce',  350,  200,  50, 'PROD-001'],
+            ['Banana (Bunch)',       'Fresh Produce',  250,  150,  45, 'PROD-002'],
+            ['Carrots (500g)',       'Fresh Produce',  180,   90,  60, 'PROD-003'],
+            ['Potatoes (kg)',        'Fresh Produce',  220,  100, 100, 'PROD-004'],
             // Meat & Seafood
-            ['Chicken Breast (kg)', 'Meat & Seafood',  850,  600,  30],
-            ['Ground Beef (kg)',    'Meat & Seafood', 1200,  900,  25],
-            ['Pork Liempo (kg)',    'Meat & Seafood',  780,  550,  20],
-            ['Tilapia (kg)',        'Meat & Seafood',  380,  220,  15],
+            ['Chicken Breast (kg)', 'Meat & Seafood',  850,  600,  30, 'MEAT-001'],
+            ['Ground Beef (kg)',    'Meat & Seafood', 1200,  900,  25, 'MEAT-002'],
+            ['Pork Liempo (kg)',    'Meat & Seafood',  780,  550,  20, 'MEAT-003'],
+            ['Tilapia (kg)',        'Meat & Seafood',  380,  220,  15, 'MEAT-004'],
             // Dairy & Eggs
-            ['Fresh Milk (1L)',     'Dairy & Eggs',   120,   80,  40],
-            ['Cheese Slice (10s)', 'Dairy & Eggs',    220,  140,  25],
-            ['Dozen Eggs',         'Dairy & Eggs',    120,   85,  12],
-            ['Butter (Salted)',    'Dairy & Eggs',    280,  200,  18],
+            ['Fresh Milk (1L)',     'Dairy & Eggs',   120,   80,  40, 'DAIR-001'],
+            ['Cheese Slice (10s)', 'Dairy & Eggs',    220,  140,  25, 'DAIR-002'],
+            ['Dozen Eggs',         'Dairy & Eggs',    120,   85,  12, 'DAIR-003'],
+            ['Butter (Salted)',    'Dairy & Eggs',    280,  200,  18, 'DAIR-004'],
             // Beverages
-            ['Orange Juice (1L)',  'Beverages',       120,   75,  40],
-            ['Coca-Cola (1.5L)',   'Beverages',        75,   45, 100],
-            ['Mineral Water (6s)', 'Beverages',        80,   45, 120],
-            ['Iced Coffee Can',    'Beverages',        75,   40,  60],
+            ['Orange Juice (1L)',  'Beverages',       120,   75,  40, 'BEV-001'],
+            ['Coca-Cola (1.5L)',   'Beverages',        75,   45, 100, 'BEV-002'],
+            ['Mineral Water (6s)', 'Beverages',        80,   45, 120, 'BEV-003'],
+            ['Iced Coffee Can',    'Beverages',        75,   40,  60, 'BEV-004'],
             // Snacks
-            ['Lays Chips (40g)',   'Snacks & Sweets',  45,   28,  80],
-            ['Rebisco Crackers',   'Snacks & Sweets',  18,   10, 150],
-            ['Toblerone (200g)',   'Snacks & Sweets', 350,  220,  30],
-            ['Oreo (137g)',        'Snacks & Sweets',  65,   40,  60],
+            ['Lays Chips (40g)',   'Snacks & Sweets',  45,   28,  80, 'SNAK-001'],
+            ['Rebisco Crackers',   'Snacks & Sweets',  18,   10, 150, 'SNAK-002'],
+            ['Toblerone (200g)',   'Snacks & Sweets', 350,  220,  30, 'SNAK-003'],
+            ['Oreo (137g)',        'Snacks & Sweets',  65,   40,  60, 'SNAK-004'],
             // Household
-            ['Tide Powder (1kg)',  'Household',       180,  120,  35],
-            ['Joy Dishwashing',   'Household',        95,   60,  40],
-            ['Safeguard Bar',     'Household',        78,   48,  50],
-            ['Downy Fabric Soft', 'Household',       105,   65,  30],
+            ['Tide Powder (1kg)',  'Household',       180,  120,  35, 'HOUS-001'],
+            ['Joy Dishwashing',   'Household',        95,   60,  40, 'HOUS-002'],
+            ['Safeguard Bar',     'Household',        78,   48,  50, 'HOUS-003'],
+            ['Downy Fabric Soft', 'Household',       105,   65,  30, 'HOUS-004'],
         ];
 
-        foreach ($products as [$name, $cat, $price, $cost, $stock]) {
+        foreach ($products as [$name, $cat, $price, $cost, $stock, $sku]) {
             DB::table('products')->insert([
-                'store_id'    => $storeId,
-                'category_id' => $catIds[$cat],
-                'name'        => $name,
-                'price'       => $price,
-                'cost'        => $cost,
-                'stock'       => $stock,
-                'is_active'   => true,
-                'created_at'  => $now,
-                'updated_at'  => $now,
+                'store_id'            => $storeId,
+                'category_id'         => $catIds[$cat],
+                'name'                => $name,
+                'sku'                 => $sku,
+                'price'               => (int) ($price * 100),
+                'cost_price'          => (int) ($cost * 100),
+                'stock_quantity'      => $stock,
+                'low_stock_threshold' => 10,
+                'is_active'           => true,
+                'created_at'          => $now,
+                'updated_at'          => $now,
             ]);
         }
 
         $this->command?->info("  ✓ Products created (" . count($products) . ")");
 
-        // ── 6. Terminal ──────────────────────────────────────────────────────
-        $terminalId = null;
+        // ── 5. Terminal ──────────────────────────────────────────────────────
         if (Schema::hasTable('terminals')) {
-            $terminalId = DB::table('terminals')->insertGetId([
+            DB::table('terminals')->insert([
                 'store_id'   => $storeId,
                 'name'       => 'Main Terminal',
                 'created_at' => $now,
                 'updated_at' => $now,
             ]);
         }
-
-        // ── 7. Sample Shift with Sales ───────────────────────────────────────
-        $shiftStart = Carbon::now()->subHours(6);
-        $shiftEnd   = Carbon::now()->subHours(1);
-
-        $shiftId = DB::table('shifts')->insertGetId([
-            'user_id'         => $cashierId,
-            'store_id'        => $storeId,
-            'terminal_id'     => $terminalId,
-            'status'          => 'closed',
-            'opening_cash'    => 5000.00,
-            'closing_cash'    => 7342.50,
-            'total_sales'     => 2342.50,
-            'total_cash'      => 1800.00,
-            'total_gcash'     => 342.50,
-            'total_card'      => 200.00,
-            'start_time'      => $shiftStart,
-            'end_time'        => $shiftEnd,
-            'created_at'      => $shiftStart,
-            'updated_at'      => $shiftEnd,
-        ]);
-
-        // Create 5 sample sales
-        $sampleSales = [
-            [
-                'items'       => [['Coca-Cola (1.5L)', 2], ['Lays Chips (40g)', 3]],
-                'payment'     => 'cash',
-                'total'       => 285.00,
-                'paid'        => 300.00,
-                'change'      => 15.00,
-                'offset_mins' => 300,
-            ],
-            [
-                'items'       => [['Chicken Breast (kg)', 1], ['Fresh Milk (1L)', 2]],
-                'payment'     => 'gcash',
-                'total'       => 1090.00,
-                'paid'        => 1090.00,
-                'change'      => 0.00,
-                'offset_mins' => 240,
-            ],
-            [
-                'items'       => [['Dozen Eggs', 2], ['Butter (Salted)', 1]],
-                'payment'     => 'cash',
-                'total'       => 520.00,
-                'paid'        => 600.00,
-                'change'      => 80.00,
-                'offset_mins' => 180,
-            ],
-            [
-                'items'       => [['Toblerone (200g)', 1], ['Oreo (137g)', 2]],
-                'payment'     => 'card',
-                'total'       => 480.00,
-                'paid'        => 480.00,
-                'change'      => 0.00,
-                'offset_mins' => 120,
-            ],
-            [
-                'items'       => [['Red Apple (kg)', 1], ['Banana (Bunch)', 1], ['Orange Juice (1L)', 2]],
-                'payment'     => 'cash',
-                'total'       => 840.00,
-                'paid'        => 1000.00,
-                'change'      => 160.00,
-                'offset_mins' => 60,
-            ],
-        ];
-
-        $productPrices = DB::table('products')
-            ->where('store_id', $storeId)
-            ->pluck('price', 'name');
-        $productIds = DB::table('products')
-            ->where('store_id', $storeId)
-            ->pluck('id', 'name');
-
-        foreach ($sampleSales as $i => $sale) {
-            $saleTime = Carbon::now()->subMinutes($sale['offset_mins']);
-
-            $saleId = DB::table('sales')->insertGetId([
-                'store_id'       => $storeId,
-                'cashier_id'     => $cashierId,
-                'shift_id'       => $shiftId,
-                'terminal_id'    => $terminalId,
-                'total_amount'   => $sale['total'],
-                'amount_paid'    => $sale['paid'],
-                'change_amount'  => $sale['change'],
-                'payment_method' => $sale['payment'],
-                'status'         => 'completed',
-                'created_at'     => $saleTime,
-                'updated_at'     => $saleTime,
-            ]);
-
-            foreach ($sale['items'] as [$productName, $qty]) {
-                $pid   = $productIds[$productName] ?? null;
-                $price = $productPrices[$productName] ?? 0;
-                if (!$pid) continue;
-
-                DB::table('sale_items')->insert([
-                    'sale_id'    => $saleId,
-                    'product_id' => $pid,
-                    'quantity'   => $qty,
-                    'price'      => $price,
-                    'subtotal'   => $price * $qty,
-                    'created_at' => $saleTime,
-                    'updated_at' => $saleTime,
-                ]);
-            }
-        }
-
-        $this->command?->info("  ✓ Shift + 5 sample sales created");
 
         $this->command?->info('');
         $this->command?->info('🎉 Demo seeding complete!');
@@ -311,4 +178,3 @@ class DemoSeeder extends Seeder
         $this->command?->info('   Cashier → cashier@demo.com / demo1234');
     }
 }
-
