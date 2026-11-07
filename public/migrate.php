@@ -4,29 +4,25 @@
  * ============================================================
  * WEB-BASED MIGRATION RUNNER — InfinityFree Deploy Helper
  * ============================================================
- *
- * Since InfinityFree has no SSH, this script lets you run
- * `php artisan migrate` via the browser with a secret token.
- *
- * HOW TO USE:
- *   Visit: https://yourdomain.com/migrate.php?token=YOUR_MIGRATE_TOKEN
- *
- * ⚠️  SECURITY: DELETE THIS FILE after first run!
- *   InfinityFree File Manager → htdocs/public/ → delete migrate.php
- *
- * The MIGRATE_TOKEN is set in your .env file (and GitHub Secret).
  */
 
-// ── Bootstrap Laravel ────────────────────────────────────────
+ini_set('display_errors', '1');
+ini_set('display_startup_errors', '1');
+error_reporting(E_ALL);
+
+header('Content-Type: text/plain; charset=UTF-8');
+
 define('LARAVEL_START', microtime(true));
 
-require __DIR__ . '/../vendor/autoload.php';
+$baseDir = dirname(__DIR__);
 
-$app = require_once __DIR__ . '/../bootstrap/app.php';
-$kernel = $app->make(Illuminate\Contracts\Http\Kernel::class);
+if (!file_exists($baseDir . '/vendor/autoload.php')) {
+    die("Error: vendor/autoload.php not found at " . $baseDir . "/vendor/autoload.php\n");
+}
+require $baseDir . '/vendor/autoload.php';
 
-// ── Token protection ─────────────────────────────────────────
-$envPath = __DIR__ . '/../.env';
+// Parse .env directly for token
+$envPath = $baseDir . '/.env';
 $envVars = [];
 if (file_exists($envPath)) {
     foreach (file($envPath) as $line) {
@@ -40,65 +36,56 @@ if (file_exists($envPath)) {
 $validToken = $envVars['MIGRATE_TOKEN'] ?? null;
 $givenToken = $_GET['token'] ?? '';
 
-header('Content-Type: text/plain; charset=UTF-8');
-
-if (!$validToken || !hash_equals($validToken, $givenToken)) {
+if (!$validToken || !hash_equals((string)$validToken, (string)$givenToken)) {
     http_response_code(403);
-    echo "403 Forbidden — invalid or missing token.\n";
-    exit;
+    die("403 Forbidden — invalid or missing token.\nExpected token configured in .env: " . ($validToken ? 'YES' : 'NO') . "\n");
 }
 
-// ── Run migrations ───────────────────────────────────────────
+try {
+    $app = require_once $baseDir . '/bootstrap/app.php';
+    $kernel = $app->make(Illuminate\Contracts\Console\Kernel::class);
+    $kernel->bootstrap();
+} catch (\Throwable $e) {
+    die("Bootstrap Error: " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
+}
+
 $action = $_GET['action'] ?? 'migrate';
-
-$app->make('Illuminate\Foundation\Bootstrap\LoadEnvironmentVariables')->bootstrap($app);
-$app->make('Illuminate\Foundation\Bootstrap\LoadConfiguration')->bootstrap($app);
-$app->make('Illuminate\Foundation\Bootstrap\HandleExceptions')->bootstrap($app);
-$app->make('Illuminate\Foundation\Bootstrap\RegisterFacades')->bootstrap($app);
-$app->make('Illuminate\Foundation\Bootstrap\RegisterProviders')->bootstrap($app);
-$app->make('Illuminate\Foundation\Bootstrap\BootProviders')->bootstrap($app);
-
-$artisan = $app->make(Illuminate\Contracts\Console\Kernel::class);
 
 echo "=== Inertia POS — Web Migration Runner ===\n";
 echo "Action: {$action}\n";
 echo "Time: " . date('Y-m-d H:i:s') . "\n\n";
 
-ob_start();
+try {
+    if ($action === 'migrate') {
+        echo "Running: php artisan migrate --force\n\n";
+        $exitCode = $kernel->call('migrate', ['--force' => true]);
+        echo $kernel->output();
+        echo "\nExit code: {$exitCode}\n";
+        echo "\n✅ Migrations complete!\n";
+        echo "\n⚠️  Next step: visit ?token={$givenToken}&action=seed to seed demo data\n";
 
-if ($action === 'migrate') {
-    echo "Running: php artisan migrate --force\n\n";
-    $exitCode = $artisan->call('migrate', ['--force' => true]);
-    echo $artisan->output();
-    echo "\nExit code: {$exitCode}\n";
-    echo "\n✅ Migrations complete!\n";
-    echo "\n⚠️  Next: visit ?token={$givenToken}&action=seed to seed demo data\n";
-    echo "⚠️  Then DELETE this file from InfinityFree File Manager!\n";
+    } elseif ($action === 'seed') {
+        echo "Running: php artisan db:seed --class=DemoSeeder --force\n\n";
+        $exitCode = $kernel->call('db:seed', [
+            '--class' => 'DemoSeeder',
+            '--force' => true,
+        ]);
+        echo $kernel->output();
+        echo "\nExit code: {$exitCode}\n";
+        echo "\n✅ Demo data seeded!\n";
+        echo "\n🔑 Login with:\n";
+        echo "   Admin   → admin@demo.com   / demo1234\n";
+        echo "   Cashier → cashier@demo.com / demo1234\n";
 
-} elseif ($action === 'seed') {
-    echo "Running: php artisan db:seed --class=DemoSeeder --force\n\n";
-    $exitCode = $artisan->call('db:seed', [
-        '--class' => 'DemoSeeder',
-        '--force' => true,
-    ]);
-    echo $artisan->output();
-    echo "\nExit code: {$exitCode}\n";
-    echo "\n✅ Demo data seeded!\n";
-    echo "\n🔑 Login with:\n";
-    echo "   Admin   → admin@demo.com   / demo1234\n";
-    echo "   Cashier → cashier@demo.com / demo1234\n";
-    echo "\n⚠️  DELETE this file from InfinityFree File Manager now!\n";
+    } elseif ($action === 'status') {
+        echo "Running: php artisan migrate:status\n\n";
+        $kernel->call('migrate:status');
+        echo $kernel->output();
 
-} elseif ($action === 'status') {
-    echo "Running: php artisan migrate:status\n\n";
-    $artisan->call('migrate:status');
-    echo $artisan->output();
-
-} else {
-    echo "Unknown action '{$action}'.\n";
-    echo "Valid actions: migrate, seed, status\n";
+    } else {
+        echo "Unknown action '{$action}'.\n";
+        echo "Valid actions: migrate, seed, status\n";
+    }
+} catch (\Throwable $e) {
+    echo "\n❌ Execution Error:\n" . $e->getMessage() . "\n\n" . $e->getTraceAsString() . "\n";
 }
-
-$output = ob_get_clean();
-echo $output;
-
