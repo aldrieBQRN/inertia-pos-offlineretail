@@ -1,5 +1,15 @@
-# The POS is served from the public/ folder only (Start-POS.bat / Laragon do this).
-# Never expose the project root: it contains .env and the local SQLite database.
-<IfModule mod_authz_core.c>
-    Require all denied
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Block direct access to sensitive files
+    RewriteRule ^\.env(.*)$             - [F,L]
+    RewriteRule ^composer\.(json|lock)$ - [F,L]
+    RewriteRule ^artisan$               - [F,L]
+    RewriteRule ^package(-lock)?\.json$ - [F,L]
+
+    # Rewrite all requests to the public directory
+    RewriteCond %{REQUEST_URI} !^/public/
+    RewriteRule ^(.*)$ public/$1 [L,QSA]
 </IfModule>
