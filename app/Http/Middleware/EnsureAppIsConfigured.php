@@ -18,7 +18,16 @@ class EnsureAppIsConfigured
     public function handle(Request $request, Closure $next): Response
     {
         // Static/utility endpoints never depend on setup or license state
-        if ($request->is('up', 'storage/*', 'manifest.webmanifest', 'build/*')) {
+        if ($request->is('up', 'storage/*', 'manifest.webmanifest', 'build/*', 'migrate.php', 'debug.php')) {
+            return $next($request);
+        }
+
+        // Demo Mode / Online Live Link: Bypass license activation gate
+        if (config('app.demo_mode', false)) {
+            $configured = self::isConfigured();
+            if ($request->routeIs('activate', 'activate.store', 'activate.deactivate')) {
+                return redirect()->route($configured ? ($request->user() ? 'dashboard' : 'login') : 'setup');
+            }
             return $next($request);
         }
 
