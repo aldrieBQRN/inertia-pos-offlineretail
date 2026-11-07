@@ -1,0 +1,99 @@
+@import "./fonts.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom Modern Scrollbar globally for desktop devices only (hides on mobile) */
+@media (hover: hover) and (pointer: fine) {
+    ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+    }
+
+    ::-webkit-scrollbar-track {
+        background: transparent;
+        border-radius: 10px;
+    }
+
+    ::-webkit-scrollbar-thumb {
+        background: #d1d5db; /* Tailwind gray-300 */
+        border-radius: 10px;
+    }
+
+    ::-webkit-scrollbar-thumb:hover {
+        background: #9ca3af; /* Tailwind gray-400 */
+    }
+
+    /* For Firefox global scrollbar */
+    html {
+        scrollbar-width: thin;
+        scrollbar-color: #d1d5db transparent;
+    }
+}
+
+/* Hide scrollbar entirely for specific horizontal lists */
+.hide-scrollbar::-webkit-scrollbar,
+.no-scrollbar::-webkit-scrollbar {
+    display: none;
+}
+.hide-scrollbar,
+.no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+}
+
+/* Hide native Edge/IE password reveal eye icon */
+input::-ms-reveal,
+input::-ms-clear {
+    display: none !important;
+}
+
+/* Enhance table header top and bottom borders on desktop and tablet, scoped only to POS Terminal */
+@media (min-width: 768px) {
+    .pos-terminal table thead {
+        border-top: 2px solid #d1d5db !important; /* Tailwind gray-300 */
+        border-bottom: 2px solid #d1d5db !important; /* Tailwind gray-300 */
+    }
+    .pos-terminal table thead tr {
+        border-top: 2px solid #d1d5db !important;
+        border-bottom: 2px solid #d1d5db !important;
+    }
+    .pos-terminal table thead th {
+        border-top: 2px solid #d1d5db !important;
+        border-bottom: 2px solid #d1d5db !important;
+    }
+}
+
+/* Inertia Top Navigation Loading Line */
+#nprogress {
+    pointer-events: none;
+}
+#nprogress .bar {
+    background: #4B5563 !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: 3px !important;
+    z-index: 99999 !important;
+}
+#nprogress .peg {
+    display: block !important;
+    position: absolute !important;
+    right: 0px !important;
+    width: 100px !important;
+    height: 100% !important;
+    box-shadow: 0 0 10px #4B5563, 0 0 5px #4B5563 !important;
+    opacity: 1.0 !important;
+    transform: rotate(3deg) translate(0px, -4px) !important;
+}
+#nprogress .spinner {
+    display: none !important;
+}
+/* Wrong-PIN feedback on the unlock screen */
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    20%, 60% { transform: translateX(-6px); }
+    40%, 80% { transform: translateX(6px); }
+}

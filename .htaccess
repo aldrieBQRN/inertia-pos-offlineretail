@@ -1,0 +1,5 @@
+# The POS is served from the public/ folder only (Start-POS.bat / Laragon do this).
+# Never expose the project root: it contains .env and the local SQLite database.
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>

@@ -11,22 +11,9 @@
 /.nova
 /.phpunit.cache
 /.vscode
-*.log
-.DS_Store
-.env
-.env.infinityfree
-.env.backup
-.env.production
-.phpactor.json
-.phpunit.result.cache
-/.fleet
-/.idea
-/.nova
-/.phpunit.cache
-/.vscode
 /.zed
 /auth.json
-/node_modules
+node_modules/
 /public/build
 /public/hot
 /public/storage
@@ -38,13 +25,18 @@
 !/storage/framework/sessions/.gitignore
 !/storage/framework/views/.gitignore
 /storage/pail
-/vendor
+vendor/
 Homestead.json
 Homestead.yaml
 Thumbs.db
 
+# Packaging and Staging folders (Offline binaries, unpacked runtime, etc.)
+/packaging/staging/
+/packaging/output/
+/InertiaPOS.exe
+*.exe
+
 # Playwright
-node_modules/
 /test-results/
 /playwright-report/
 /blob-report/
@@ -56,7 +48,6 @@ vendor.zip
 zip_vendor.php
 app.env
 env.txt
-
 .env.mysql-backup
 
 # Offline Licensing Private Keys (NEVER commit private keys)

@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Wait for database to be ready (with timeout)
+echo "Waiting for database connection..."
+for i in {1..30}; do
+    if php artisan migrate:status > /dev/null 2>&1; then
+        echo "Database is ready!"
+        break
+    fi
+    echo "Attempt $i/30: Database not ready yet, waiting..."
+    sleep 2
+done
+
+# Run pending migrations
+echo "Running database migrations..."
+php artisan migrate --force
+
+echo "Application started successfully!"

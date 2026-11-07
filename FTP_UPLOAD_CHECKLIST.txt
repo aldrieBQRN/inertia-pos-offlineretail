@@ -1,0 +1,93 @@
+═══════════════════════════════════════════════════════════════
+   INERTIA POS - FTP UPLOAD CHECKLIST
+═══════════════════════════════════════════════════════════════
+
+DOMAIN: https://inertia-pos.page.gd/
+TARGET FOLDER: htdocs/
+
+═══════════════════════════════════════════════════════════════
+UPLOAD PLAN (Keep vendor folder - don't re-upload)
+═══════════════════════════════════════════════════════════════
+
+Step 1: DELETE everything in htdocs EXCEPT vendor/
+Step 2: Upload these folders & files (in order)
+
+═══════════════════════════════════════════════════════════════
+FOLDERS TO UPLOAD (smallest first - faster upload)
+═══════════════════════════════════════════════════════════════
+
+Priority 1 - SMALL FOLDERS (upload first):
+  ☐ bootstrap/
+  ☐ config/
+  ☐ app/
+  ☐ routes/
+  ☐ database/
+
+Priority 2 - MEDIUM FOLDERS:
+  ☐ public/          (contains index.php, .htaccess, build/)
+  ☐ resources/
+
+Priority 3 - LARGE FOLDERS:
+  ☐ storage/
+
+DO NOT UPLOAD:
+  ✗ node_modules/    (keep it local - not needed on server)
+  ✗ .git/            (not needed on server)
+  ✗ vendor/          (already on server - skip it)
+
+═══════════════════════════════════════════════════════════════
+FILES TO UPLOAD (to htdocs root)
+═══════════════════════════════════════════════════════════════
+
+Root Level Files:
+  ☐ .env
+  ☐ artisan
+  ☐ composer.json
+  ☐ composer.lock
+  ☐ phpunit.xml
+  ☐ vite.config.js
+  ☐ tailwind.config.js
+  ☐ postcss.config.js
+  ☐ jsconfig.json
+  ☐ package.json
+  ☐ package-lock.json
+
+═══════════════════════════════════════════════════════════════
+FILEZILLA UPLOAD STEPS
+═══════════════════════════════════════════════════════════════
+
+1. Open FileZilla
+2. Connect to InfinityFree FTP
+3. On RIGHT panel, navigate to htdocs
+4. On LEFT panel, open your local inertia-pos folder
+5. Select ALL files/folders from the list above
+6. EXCLUDE: node_modules/, .git/, vendor/
+7. Right-click → Upload
+8. Wait for completion (10-15 minutes)
+
+═══════════════════════════════════════════════════════════════
+AFTER UPLOAD VERIFICATION
+═══════════════════════════════════════════════════════════════
+
+Via FTP, verify these exist in htdocs/:
+  ✓ vendor/              (already uploaded)
+  ✓ public/              (contains index.php)
+  ✓ storage/
+  ✓ app/
+  ✓ config/
+  ✓ routes/
+  ✓ bootstrap/
+  ✓ database/
+  ✓ .env                 (file)
+
+═══════════════════════════════════════════════════════════════
+NEXT STEPS
+═══════════════════════════════════════════════════════════════
+
+1. Wait for upload to complete
+2. Visit https://inertia-pos.page.gd/
+3. Should see POS login page
+4. If error: Check storage/logs/laravel.log
+5. Set up EasyCron for scheduler
+
+═══════════════════════════════════════════════════════════════

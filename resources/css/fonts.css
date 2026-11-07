@@ -1,0 +1,20 @@
+/*
+ * Locally bundled fonts (offline). Same families and weights the app previously
+ * loaded from Google Fonts / Bunny Fonts; Vite copies the font files into public/build.
+ */
+
+/* Figtree: default UI font (Tailwind font-sans) */
+@import '@fontsource/figtree/400.css';
+@import '@fontsource/figtree/500.css';
+@import '@fontsource/figtree/600.css';
+
+/* Cormorant Garamond: brand wordmark */
+@import '@fontsource/cormorant-garamond/600.css';
+@import '@fontsource/cormorant-garamond/700.css';
+@import '@fontsource/cormorant-garamond/600-italic.css';
+@import '@fontsource/cormorant-garamond/700-italic.css';
+
+/* Manrope: brand subtitle */
+@import '@fontsource/manrope/500.css';
+@import '@fontsource/manrope/600.css';
+@import '@fontsource/manrope/700.css';
