@@ -3,6 +3,7 @@
 namespace App\Providers;
 
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Facades\Vite;
 use Illuminate\Support\ServiceProvider;
@@ -32,6 +33,9 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        // Fix for MySQL key length on older MySQL versions / shared hosting (InfinityFree)
+        Schema::defaultStringLength(191);
+
         // Configures Vite to prefetch assets for improved frontend performance
         Vite::prefetch(concurrency: 3);
 
