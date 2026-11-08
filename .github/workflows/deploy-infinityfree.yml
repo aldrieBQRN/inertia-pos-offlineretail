@@ -1,37 +1,24 @@
 name: 🚀 Deploy to InfinityFree
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY: vendor/ is uploaded ONCE manually via FTP (57 MB, 11k+ files).
-# CI/CD only deploys changed app code + freshly built Vite assets.
-# This keeps every deployment under ~2 minutes instead of 20+ minutes.
-#
-# ⚠️  If you add a new Composer package:
-#     Run `composer install --no-dev` locally, zip the vendor/ folder,
-#     upload the zip to htdocs/ via InfinityFree File Manager, then extract.
-# ─────────────────────────────────────────────────────────────────────────────
-
 on:
   push:
     branches: [demo]
-  workflow_dispatch:   # Manual trigger from GitHub Actions UI
+  workflow_dispatch:
 
 concurrency:
   group: deploy-infinityfree
-  cancel-in-progress: true   # Cancel old run if a new push comes in
+  cancel-in-progress: true
 
 jobs:
   build-and-deploy:
-    name: ⚡ Build Assets & Deploy (vendor excluded)
+    name: ⚡ Build Assets & Deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 15        # Should finish well under 5 min
+    timeout-minutes: 15
 
     steps:
-      # ─── 1. Checkout ──────────────────────────────────────────────────────
       - name: Checkout demo branch
         uses: actions/checkout@v4
 
-      # ─── 2. Node / Vite Build ─────────────────────────────────────────────
-      # This is the main job: build fresh JS/CSS assets for production
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
@@ -46,7 +33,6 @@ jobs:
         env:
           NODE_ENV: production
 
-      # ─── 3. Write production .env ─────────────────────────────────────────
       - name: Create production .env
         env:
           APP_KEY:        ${{ secrets.APP_KEY }}
@@ -61,8 +47,10 @@ jobs:
           APP_NAME="Inertia POS Demo"
           APP_ENV=production
           APP_KEY=${APP_KEY}
-          APP_DEBUG=false
+          APP_DEBUG=true
           APP_URL=${APP_URL}
+          APP_DEMO_MODE=true
+          APP_TIMEZONE=Asia/Manila
 
           APP_LOCALE=en
           APP_FALLBACK_LOCALE=en
@@ -70,7 +58,7 @@ jobs:
           BCRYPT_ROUNDS=10
 
           LOG_CHANNEL=single
-          LOG_LEVEL=warning
+          LOG_LEVEL=debug
 
           DB_CONNECTION=mysql
           DB_HOST=${DB_HOST}
@@ -96,33 +84,6 @@ jobs:
           MIGRATE_TOKEN=${MIGRATE_TOKEN}
           EOF
 
-      # ─── 4. Write InfinityFree root .htaccess ─────────────────────────────
-      # InfinityFree locks web root to htdocs/ — can't change doc root to public/
-      # This htaccess at root rewrites all traffic into /public
-      - name: Write InfinityFree root .htaccess
-        run: |
-          cat > infinityfree_root.htaccess << 'HTACCESS'
-          Options -Indexes
-
-          <IfModule mod_rewrite.c>
-              RewriteEngine On
-
-              # Block direct access to sensitive files
-              RewriteRule ^\.env(.*)$             - [F,L]
-              RewriteRule ^composer\.(json|lock)$ - [F,L]
-              RewriteRule ^artisan$               - [F,L]
-              RewriteRule ^package(-lock)?\.json$ - [F,L]
-              RewriteRule ^migrate\.php$          - [F,L]
-
-              # Route everything into /public (Laravel entry point)
-              RewriteCond %{REQUEST_URI} !^/public/
-              RewriteCond %{REQUEST_FILENAME} !-f
-              RewriteCond %{REQUEST_FILENAME} !-d
-              RewriteRule ^(.*)$ public/$1 [L,QSA]
-          </IfModule>
-          HTACCESS
-
-      # ─── 5. FTP Deploy (vendor EXCLUDED — already on server) ──────────────
       - name: Deploy app code via FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
@@ -137,35 +98,23 @@ jobs:
           exclude: |
             **/.git*
             **/.git*/**
-
-            # ── vendor/ lives on server permanently, skip every deploy ──
             **/vendor/**
-
-            # ── Node / build tools (not needed on server) ───────────────
             **/node_modules/**
-
-            # ── Tests, e2e, dev tools ────────────────────────────────────
             **/tests/**
             **/e2e/**
             **/playwright*
             **/.agents/**
             **/phpunit.xml
-
-            # ── Sensitive / local-only files ─────────────────────────────
             **/.env.mysql-backup
             **/.env.example
             **/.env.infinityfree.example
             **/env.txt
             **/app.env
-
-            # ── Compiled artifacts that shouldn't be re-uploaded ─────────
             **/storage/logs/**
             **/storage/framework/cache/**
             **/storage/framework/sessions/**
             **/storage/framework/views/**
             **/storage/pail/**
-
-            # ── Offline / packaging artifacts ────────────────────────────
             **/*.bat
             **/*.exe
             **/*.pdf
@@ -175,33 +124,6 @@ jobs:
             **/php_errors.log
             **/jsconfig.json
 
-      # ─── 6. Rename root htaccess ──────────────────────────────────────────
-      - name: Upload root .htaccess
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-        with:
-          server:     ${{ secrets.FTP_HOST }}
-          username:   ${{ secrets.FTP_USERNAME }}
-          password:   ${{ secrets.FTP_PASSWORD }}
-          local-dir:  ./
-          server-dir: /htdocs/
-          protocol:   ftp
-          port:       21
-          include: |
-            infinityfree_root.htaccess
-
-      # ─── 7. Summary ───────────────────────────────────────────────────────
       - name: ✅ Deployment summary
         run: |
-          echo ""
           echo "✅ Deployed successfully to InfinityFree!"
-          echo ""
-          echo "📦 vendor/ was NOT re-uploaded (already on server)"
-          echo "🎨 Fresh Vite build uploaded: public/build/"
-          echo "⚙️  .env written from GitHub Secrets"
-          echo ""
-          echo "── FIRST DEPLOY ONLY ──────────────────────────────────"
-          echo "1. Upload vendor/ manually (see DEPLOY.md)"
-          echo "2. Visit: ${{ secrets.APP_URL }}/migrate.php?token=TOKEN&action=migrate"
-          echo "3. Visit: ${{ secrets.APP_URL }}/migrate.php?token=TOKEN&action=seed"
-          echo "4. DELETE migrate.php from InfinityFree File Manager"
-          echo "────────────────────────────────────────────────────────"
