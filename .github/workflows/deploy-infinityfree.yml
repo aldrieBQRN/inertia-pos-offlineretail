@@ -50,6 +50,7 @@ jobs:
           APP_DEBUG=true
           APP_URL=${APP_URL}
           APP_DEMO_MODE=true
+          APP_TIMEZONE=Asia/Manila
 
           APP_LOCALE=en
           APP_FALLBACK_LOCALE=en
