@@ -66,7 +66,9 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
     // Client revision state variables
     const [isWholesaleActive, setIsWholesaleActive] = useState(false);
     const [showResultsOnly, setShowResultsOnly] = useState(() => {
-        return localStorage.getItem('pos_show_results_only') === 'true';
+        const raw = localStorage.getItem('pos_show_results_only');
+        // Accept both 'true' (canonical) and legacy '1' from older Settings builds
+        return raw === 'true' || raw === '1';
     });
     const [showQtyModal, setShowQtyModal] = useState(false);
     const [qtyModalProduct, setQtyModalProduct] = useState(null);
@@ -177,7 +179,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
     }, []);
 
     useEffect(() => {
-        localStorage.setItem('pos_show_results_only', showResultsOnly);
+        localStorage.setItem('pos_show_results_only', showResultsOnly ? 'true' : 'false');
     }, [showResultsOnly]);
 
     useEffect(() => {
