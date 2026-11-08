@@ -59,7 +59,9 @@ export default function Settings({ auth, initial_settings }) {
         return localStorage.getItem('pos_enable_shortcuts') !== 'false';
     });
     const [showResultsOnly, setShowResultsOnly] = useState(() => {
-        return localStorage.getItem('pos_show_results_only') === '1';
+        const raw = localStorage.getItem('pos_show_results_only');
+        // Accept both 'true' (canonical) and legacy '1' from older builds
+        return raw === 'true' || raw === '1';
     });
     const [isFullScreen, setIsFullScreen] = useState(false);
 
@@ -246,7 +248,8 @@ export default function Settings({ auth, initial_settings }) {
     const toggleResultsOnly = () => {
         const newVal = !showResultsOnly;
         setShowResultsOnly(newVal);
-        localStorage.setItem('pos_show_results_only', newVal ? '1' : '0');
+        // Canonical format matches PosTerminal and other workstation prefs ('true'/'false')
+        localStorage.setItem('pos_show_results_only', newVal ? 'true' : 'false');
         Swal.fire({
             icon: 'success',
             title: newVal ? 'Results Only Mode Enabled' : 'Results Only Mode Disabled',
