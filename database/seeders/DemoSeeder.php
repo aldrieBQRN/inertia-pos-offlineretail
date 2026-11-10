@@ -39,7 +39,9 @@ class DemoSeeder extends Seeder
 
     public function run(): void
     {
+        // Ask only in an interactive console; --force (CLI or the web migration runner) is the confirmation
         if (app()->environment('production')
+            && ! $this->command?->option('force')
             && ! $this->command?->confirm('This wipes ALL store data (products, sales, shifts, users). Continue?', false)) {
             $this->command?->warn('Aborted. Nothing was changed.');
             return;

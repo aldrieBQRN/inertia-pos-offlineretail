@@ -20,7 +20,9 @@ class ClearTransactionsAndShiftsSeeder extends Seeder
 {
     public function run(): void
     {
+        // Ask only in an interactive console; --force is the confirmation
         if (app()->environment('production')
+            && ! $this->command->option('force')
             && ! $this->command->confirm('This permanently deletes ALL sales and shift records. Continue?', false)) {
             $this->command->warn('Aborted. Nothing was deleted.');
             return;
