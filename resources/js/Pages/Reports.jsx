@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { formatQty, productQtyDecimals, isMultiUom } from '@/Utils/quantity';
 import axios from 'axios';
 import AuthenticatedLayout from '@/Layouts/AuthenticatedLayout';
 import { Head, Link } from '@inertiajs/react';
@@ -26,6 +27,10 @@ const formatCurrency = (cents) => {
 const formatNumber = (num) => {
     return (num || 0).toLocaleString('en-US');
 };
+
+// Product quantities: each product's precision (Multiple UOM) and its unit
+const formatRowQty = (row, num) => formatQty(num, productQtyDecimals(row));
+const rowUnit = (row) => (isMultiUom(row) && row.base_unit ? row.base_unit : null);
 
 const formatPaymentName = (method) => {
     if (!method) return 'Unknown';
@@ -489,7 +494,7 @@ export default function Reports({ auth, initial_report_data }) {
                     { width: 18 }, { width: 32 }, { width: 22 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 20 }, { width: 20 }
                 ];
             } else if (activeTab === 'shifts') {
-                headers = ['Shift ID', 'Cashier', 'Terminal', 'Open Time', 'Close Time', 'Starting Float', 'Cash Sales', 'Expected Cash', 'Actual Cash', 'Over / Short'];
+                headers = ['Shift ID', 'Cashier', 'Terminal', 'Open Time', 'Close Time', 'Starting Cash', 'Cash Sales', 'Expected Cash', 'Actual Cash', 'Over / Short'];
                 worksheet.columns = [
                     { width: 12 }, { width: 22 }, { width: 16 }, { width: 20 }, { width: 20 }, { width: 16 }, { width: 16 }, { width: 18 }, { width: 18 }, { width: 16 }
                 ];
@@ -653,7 +658,7 @@ export default function Reports({ auth, initial_report_data }) {
 
                 const summaryRow = worksheet.getRow(summaryStartRow + 2);
                 summaryRow.getCell(1).value = `Total Shifts: ${currentDataset.length}`;
-                summaryRow.getCell(4).value = `Total Starting Float: ${formatCurrency(totalStarting * 100)}`;
+                summaryRow.getCell(4).value = `Total Starting Cash: ${formatCurrency(totalStarting * 100)}`;
                 summaryRow.getCell(6).value = `Total Cash Sales: ${formatCurrency(totalCashSales * 100)}`;
                 summaryRow.getCell(8).value = `Total Expected: ${formatCurrency(totalExpected * 100)}`;
                 summaryRow.getCell(10).value = `Net Variance: ${formatCurrency(totalDiff * 100)}`;
@@ -770,7 +775,7 @@ export default function Reports({ auth, initial_report_data }) {
                     r.category_name,
                     `P ${formatCurrency(r.unit_retail_price)}`,
                     `P ${formatCurrency(r.unit_cost_price)}`,
-                    formatNumber(r.units_sold),
+                    `${formatRowQty(r, r.units_sold)}${rowUnit(r) ? ` ${rowUnit(r)}` : ''}`,
                     `P ${formatCurrency(r.total_revenue)}`,
                     `P ${formatCurrency(r.total_profit)}`,
                     `${r.margin_percent}%`
@@ -781,14 +786,14 @@ export default function Reports({ auth, initial_report_data }) {
                     r.sku,
                     r.name,
                     r.category_name,
-                    formatNumber(r.stock_quantity),
+                    `${formatRowQty(r, r.stock_quantity)}${rowUnit(r) ? ` ${rowUnit(r)}` : ''}`,
                     `P ${formatCurrency(r.cost_price)}`,
                     `P ${formatCurrency(r.retail_price)}`,
                     `P ${formatCurrency(r.total_cost_value)}`,
                     `P ${formatCurrency(r.total_retail_value)}`
                 ]);
             } else if (activeTab === 'shifts') {
-                tableHead = [['ID', 'Cashier', 'Terminal', 'Open Time', 'Close Time', 'Float', 'Cash Sales', 'Expected', 'Actual', 'Variance']];
+                tableHead = [['ID', 'Cashier', 'Terminal', 'Open Time', 'Close Time', 'Starting Cash', 'Cash Sales', 'Expected', 'Actual', 'Variance']];
                 tableBody = currentDataset.map(r => [
                     `#${r.id}`,
                     r.cashier_name,
@@ -1859,7 +1864,7 @@ export default function Reports({ auth, initial_report_data }) {
                                                                 <th className="p-3.5 sm:p-4 min-w-[140px]">Shift ID / Date</th>
                                                                 <th className="p-3.5 sm:p-4 min-w-[150px]">Cashier</th>
                                                                 <th className="p-3.5 sm:p-4 min-w-[160px]">Opening Time / End</th>
-                                                                <th className="p-3.5 sm:p-4 text-right">Start Float</th>
+                                                                <th className="p-3.5 sm:p-4 text-right">Starting Cash</th>
                                                                 <th className="p-3.5 sm:p-4 text-right">Cash Sales</th>
                                                                 <th className="p-3.5 sm:p-4 text-right">Expected Drawer</th>
                                                                 <th className="p-3.5 sm:p-4 text-right">Actual Counted</th>
@@ -1914,7 +1919,7 @@ export default function Reports({ auth, initial_report_data }) {
                                                                                 {item.category_name}
                                                                             </span>
                                                                         </td>
-                                                                        <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-gray-900">{formatNumber(item.units_sold)}</td>
+                                                                        <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-gray-900">{formatRowQty(item, item.units_sold)}{rowUnit(item) && <span className="block text-[10px] font-semibold text-gray-500">{rowUnit(item)}</span>}</td>
                                                                         <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-[#1B3A69]">{formatCurrency(item.total_revenue)}</td>
                                                                         <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-emerald-700">{formatCurrency(item.total_profit)}</td>
                                                                         <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-gray-700">{item.margin_percent}%</td>
@@ -1941,7 +1946,7 @@ export default function Reports({ auth, initial_report_data }) {
                                                                                 {item.category_name}
                                                                             </span>
                                                                         </td>
-                                                                        <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-gray-900">{formatNumber(item.stock_quantity)}</td>
+                                                                        <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-gray-900">{formatRowQty(item, item.stock_quantity)}{rowUnit(item) && <span className="block text-[10px] font-semibold text-gray-500">{rowUnit(item)}</span>}</td>
                                                                         <td className="p-3.5 sm:p-4 text-right text-xs sm:text-sm text-gray-600">{formatCurrency(item.total_cost_value)}</td>
                                                                         <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-[#1B3A69]">{formatCurrency(item.total_retail_value)}</td>
                                                                         <td className="p-3.5 sm:p-4 text-right font-bold text-xs sm:text-sm text-emerald-700">{formatCurrency(item.potential_profit)}</td>
@@ -2100,7 +2105,7 @@ export default function Reports({ auth, initial_report_data }) {
                                                                 <div>
                                                                     <span className="text-gray-400 text-[10px] font-black uppercase tracking-wider block">UNITS SOLD</span>
                                                                     <span className="font-bold text-gray-900 text-xs sm:text-sm font-mono">
-                                                                        {formatNumber(item.units_sold)} pcs
+                                                                        {formatRowQty(item, item.units_sold)} {rowUnit(item) || 'pcs'}
                                                                     </span>
                                                                 </div>
                                                                 <div>
@@ -2152,7 +2157,7 @@ export default function Reports({ auth, initial_report_data }) {
                                                                 <div>
                                                                     <span className="text-gray-400 text-[10px] font-black uppercase tracking-wider block">CURRENT STOCK</span>
                                                                     <span className="font-bold text-gray-900 text-xs sm:text-sm font-mono">
-                                                                        {formatNumber(item.stock_quantity)} in stock
+                                                                        {formatRowQty(item, item.stock_quantity)}{rowUnit(item) ? ` ${rowUnit(item)}` : ''} in stock
                                                                     </span>
                                                                 </div>
                                                                 <div>
@@ -2213,7 +2218,7 @@ export default function Reports({ auth, initial_report_data }) {
 
                                                             <div className="grid grid-cols-2 gap-2 pt-2.5 border-t border-gray-100 text-xs font-mono">
                                                                 <div>
-                                                                    <span className="text-gray-400 text-[10px] font-black uppercase tracking-wider block font-sans">START FLOAT</span>
+                                                                    <span className="text-gray-400 text-[10px] font-black uppercase tracking-wider block font-sans">STARTING CASH</span>
                                                                     <span className="font-semibold text-gray-600 text-xs">
                                                                         {Number(item.starting_cash || item.opening_float || 0).toFixed(2)}
                                                                     </span>

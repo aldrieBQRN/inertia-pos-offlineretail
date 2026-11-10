@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 
 /**
  * CashMovement Model
- * Tracks intermediate and mid-shift cash drawer adjustments (Owner Draws, Safe Drops, Petty Cash, Float Topups).
+ * Tracks intermediate and mid-shift cash drawer adjustments (Owner Draws, Safe Drops, Petty Cash, Cash Top-ups).
  */
 class CashMovement extends Model
 {

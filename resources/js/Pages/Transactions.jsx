@@ -1188,7 +1188,7 @@ export default function Transactions({ auth, initial_transactions, initial_setti
                             <div className="flex justify-between items-start gap-2">
                                 <div className="space-y-0.5 sm:space-y-1 min-w-0">
                                     <p className="text-[10px] sm:text-[11px] font-black text-emerald-700 uppercase tracking-wider truncate">
-                                        {isAdmin ? 'Cash in Drawer' : 'My Cash Float'}
+                                        {isAdmin ? 'Cash in Drawer' : 'My Cash in Drawer'}
                                     </p>
                                     <h3 className="text-base sm:text-2xl font-black text-emerald-900 tracking-tight truncate">{formatCurrency(kpiMetrics.cashRevenue)}</h3>
                                 </div>
@@ -2113,14 +2113,14 @@ export default function Transactions({ auth, initial_transactions, initial_setti
                                             <tr key={idx}>
                                                 <td className="py-2.5 px-3">
                                                     <div className="font-bold text-gray-900 leading-tight">
-                                                        {item.display_name || item.custom_name || item.product?.name || 'Product'}
+                                                        {item.display_name || item.custom_name || item.product?.name || 'Product'} {item.unit_name ? `(${item.unit_name})` : ''}
                                                     </div>
                                                     <div className="text-[10px] text-gray-400 mt-0.5">
                                                         {formatCurrency(item.unit_price)} each
                                                     </div>
                                                 </td>
                                                 <td className="py-2.5 px-2 text-center font-black text-gray-600">
-                                                    x{item.quantity}
+                                                    {item.quantity}
                                                 </td>
                                                 <td className="py-2.5 px-3 text-right font-black text-gray-900">
                                                     {formatCurrency((item.unit_price || 0) * (item.quantity || 0))}

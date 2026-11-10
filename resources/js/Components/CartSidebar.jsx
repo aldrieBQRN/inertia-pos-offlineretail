@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import useCartStore from '@/Stores/useCartStore';
+import useCartStore, { cartItemKey } from '@/Stores/useCartStore';
+import { formatQty, formatProductQty, stockUnitLabel, reservedBaseQty, roundQty, lineAmount, isMultiUom } from '@/Utils/quantity';
 import usePrinterStore from '@/Stores/usePrinterStore';
 import PaymentModal from './PaymentModal';
 import DiscountModal from './DiscountModal';
@@ -187,6 +188,8 @@ export default function CartSidebar({
                 if (selectedItem) {
                     if (e.key === 'Enter') {
                         e.preventDefault();
+                        // Enter on a selected line opens the quantity window (type 2.5, 0.75, ...)
+                        if (!isCustomItem(selectedItem) && onEditItemQty) onEditItemQty(selectedItem);
                         return;
                     }
                     if (e.key === '+' || e.key === 'Add' || e.key === '=' || e.code === 'NumpadAdd' || e.code === 'Equal') {
@@ -202,8 +205,8 @@ export default function CartSidebar({
                         if (isCustomItem(selectedItem)) {
                             return;
                         }
-                        removeFromCart(selectedItem.id);
-                        if (selectedItem.quantity === 1) {
+                        removeFromCart(selectedItem);
+                        if (selectedItem.quantity <= 1) {
                             if (cart.length <= 1) {
                                 setFocusedIndex(-1);
                             } else if (focusedIndex >= cart.length - 1) {
@@ -222,7 +225,7 @@ export default function CartSidebar({
 
             // 3. Fallback: Hover shortcuts (only if cart navigation is NOT active)
             if (focusedIndex === -1 && hoveredItemId) {
-                const hoveredItem = cart.find(item => item.id === hoveredItemId);
+                const hoveredItem = cart.find(item => cartItemKey(item) === hoveredItemId);
                 if (!hoveredItem) return;
 
                 if (e.key === '+' || e.key === 'Add' || e.key === '=' || e.code === 'NumpadAdd' || e.code === 'Equal') {
@@ -236,7 +239,7 @@ export default function CartSidebar({
                     if (isCustomItem(hoveredItem)) {
                         return;
                     }
-                    removeFromCart(hoveredItem.id);
+                    removeFromCart(hoveredItem);
                 } else if (e.key === 'Backspace' || e.key === 'Delete' || e.code === 'Backspace' || e.code === 'Delete') {
                     e.preventDefault();
                     handleRemoveEntireItem(hoveredItem);
@@ -284,11 +287,17 @@ export default function CartSidebar({
             return;
         }
 
-        if (item.quantity >= item.stock_quantity) {
+        const isMultiUom = item.selling_method === 'multiple' || !!item.is_multi_unit;
+        const conversionFactor = isMultiUom ? (Number(item.conversion_factor) || 1) : 1;
+        // All lines of this product share its stock (e.g. 1 Roll + 5 Meter)
+        const baseQtyInCart = reservedBaseQty(cart, item.id);
+        const baseStockAvailable = Number(item.stock_quantity) || 0;
+
+        if (roundQty(baseQtyInCart + conversionFactor) > baseStockAvailable) {
             Swal.fire({
                 icon: 'error',
                 title: 'Limit Reached',
-                text: `Only ${item.stock_quantity} stocks remaining!`,
+                text: `Only ${formatProductQty(item, baseStockAvailable)} ${stockUnitLabel(item)} available in stock.`,
                 toast: true,
                 position: 'top',
                 showConfirmButton: false,
@@ -306,7 +315,7 @@ export default function CartSidebar({
             if (item.is_custom && itemToRemove.is_custom) {
                 return item.custom_key === itemToRemove.custom_key;
             }
-            return item.id === itemToRemove.id;
+            return cartItemKey(item) === cartItemKey(itemToRemove);
         };
         const indexToRemove = cart.findIndex(isMatch);
         const updatedCart = cart.filter(item => !isMatch(item));
@@ -418,9 +427,13 @@ export default function CartSidebar({
                     const isCustom = item.is_custom === true || (typeof item.id === 'string' && item.id.startsWith('custom-'));
                     return {
                         id: isCustom ? null : item.id,
-                        quantity: Number(item.quantity),
+                        quantity: roundQty(Number(item.quantity)),
                         name: isCustom ? item.name : undefined,
-                        price: item.price / 100
+                        price: item.price / 100,
+                        // Multiple UOM: which selling unit was rung up, so the server deducts
+                        // quantity x conversion factor (e.g. 1 Yard = 1.5 Meter) at that unit's price
+                        product_unit_id: isCustom ? null : (item.product_unit_id ?? null),
+                        is_wholesale: !!item.is_wholesale
                     };
                 }),
                 payment_method: paymentDetails.method,
@@ -568,7 +581,7 @@ export default function CartSidebar({
                 {/* SUB-HEADER: COLUMN HEADERS — desktop only */}
                 <div className="px-4 py-2.5 bg-gray-50/80 border-b border-gray-200/80 shrink-0 hidden lg:block">
                     {/* COLUMNS HEADERS */}
-                    <div className="grid grid-cols-[85px_1fr_95px_100px] gap-2 text-gray-500 uppercase text-[10px] font-black tracking-wider whitespace-nowrap">
+                    <div className="grid grid-cols-[124px_1fr_95px_100px] gap-2 text-gray-500 uppercase text-[10px] font-black tracking-wider whitespace-nowrap">
                         <div className="text-center">Qty</div>
                         <div className="pl-3">Description</div>
                         <div className="text-right">Price</div>
@@ -589,18 +602,18 @@ export default function CartSidebar({
                     ) : (
                         <div className="flex flex-col p-2 lg:p-0 gap-2 lg:gap-0 bg-white divide-y divide-gray-100/80">
                             {cart.map((item, index) => (
-                                <React.Fragment key={item.id}>
+                                <React.Fragment key={cartItemKey(item)}>
                                     {/* Desktop Row */}
                                     <div
-                                        onMouseEnter={() => setHoveredItemId(item.id)}
-                                        onMouseLeave={() => setHoveredItemId(prev => prev === item.id ? null : prev)}
+                                        onMouseEnter={() => setHoveredItemId(cartItemKey(item))}
+                                        onMouseLeave={() => setHoveredItemId(prev => prev === cartItemKey(item) ? null : prev)}
                                         onClick={() => {
                                             if (disabled) return;
                                             window.dispatchEvent(new CustomEvent('close-category-dropdown'));
                                             window.dispatchEvent(new CustomEvent('reset-catalog-nav'));
                                             setFocusedIndex(index);
                                         }}
-                                        className={`w-full cart-item-row hidden lg:grid grid-cols-[85px_1fr_95px_100px] gap-2 px-4 py-2.5 items-center hover:bg-gray-50/80 transition-colors text-xs font-bold group cursor-pointer ${focusedIndex === index ? 'bg-[#EFF4F9]/70 ring-1 ring-inset ring-[#1B3B6A]/40' : ''}`}
+                                        className={`w-full cart-item-row hidden lg:grid grid-cols-[124px_1fr_95px_100px] gap-2 px-4 py-2.5 items-center hover:bg-gray-50/80 transition-colors text-xs font-bold group cursor-pointer ${focusedIndex === index ? 'bg-[#EFF4F9]/70 ring-1 ring-inset ring-[#1B3B6A]/40' : ''}`}
                                     >
                                         {/* QTY Column with Hover Controls */}
                                         <div className="flex items-center justify-between h-7 select-none relative w-full bg-gray-50 rounded-none p-0.5 border border-gray-200">
@@ -609,7 +622,7 @@ export default function CartSidebar({
                                                     <button
                                                         onClick={(e) => {
                                                              e.stopPropagation();
-                                                             removeFromCart(item.id);
+                                                             removeFromCart(item);
                                                         }}
                                                         disabled={disabled}
                                                         className="w-5 h-5 bg-white hover:bg-[#1B3A69] hover:text-white rounded-none text-gray-700 flex items-center justify-center transition-all shrink-0 font-mono text-xs font-black shadow-2xs cursor-pointer disabled:cursor-not-allowed"
@@ -617,9 +630,18 @@ export default function CartSidebar({
                                                     >
                                                         -
                                                     </button>
-                                                    <span className="flex-1 text-center font-black text-gray-900 font-mono text-xs">
-                                                        {item.quantity}
-                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            if (!disabled && onEditItemQty) onEditItemQty(item);
+                                                        }}
+                                                        disabled={disabled}
+                                                        className="flex-1 min-w-0 px-1 text-center font-black text-gray-900 font-mono text-xs tabular-nums whitespace-nowrap hover:text-[#1B3B6A] hover:underline decoration-dotted underline-offset-2 cursor-pointer disabled:cursor-not-allowed"
+                                                        title={isMultiUom(item) ? 'Click (or press Enter) to type a quantity, e.g. 2.5' : 'Click (or press Enter) to type a quantity'}
+                                                    >
+                                                        {formatQty(item.quantity)}
+                                                    </button>
                                                     <button
                                                         onClick={(e) => {
                                                              e.stopPropagation();
@@ -634,15 +656,15 @@ export default function CartSidebar({
                                                 </>
                                             ) : (
                                                 <span className="flex-1 text-center font-black text-gray-900 font-mono text-xs">
-                                                    {item.quantity}
+                                                    {formatQty(item.quantity)}
                                                 </span>
                                             )}
                                         </div>
 
                                         {/* DESCRIPTION Column */}
                                         <div className="min-w-0 pl-3 pr-1 flex items-center justify-between">
-                                            <span className="font-bold text-gray-900 text-xs truncate leading-tight block select-none" title={item.name}>
-                                                {item.name}
+                                            <span className="font-bold text-gray-900 text-xs sm:text-sm truncate leading-tight block select-none" title={item.name}>
+                                                {item.name} {item.unit_name ? `(${item.unit_name})` : ''}
                                             </span>
                                             <button
                                                 onClick={(e) => {
@@ -658,13 +680,13 @@ export default function CartSidebar({
                                         </div>
 
                                         {/* PRICE Column */}
-                                        <div className="text-right text-gray-500 font-mono font-medium text-xs">
+                                        <div className="text-right text-gray-900 font-mono font-semibold text-xs">
                                             {formatPrice(item.price)}
                                         </div>
 
                                         {/* AMOUNT Column */}
                                         <div className="text-right text-gray-900 font-mono font-black text-xs sm:text-sm">
-                                            {formatPrice(item.price * item.quantity)}
+                                            {formatPrice(lineAmount(item))}
                                         </div>
                                     </div>
 
@@ -681,7 +703,7 @@ export default function CartSidebar({
                                         {/* Top section: Name and Delete button */}
                                         <div className="flex justify-between items-start gap-2">
                                             <span className="font-bold text-gray-900 text-xs sm:text-sm line-clamp-2 select-none leading-tight" title={item.name}>
-                                                {item.name}
+                                                {item.name} {item.unit_name ? `(${item.unit_name})` : ''}
                                             </span>
                                             <button
                                                 onClick={(e) => {
@@ -704,7 +726,7 @@ export default function CartSidebar({
                                                     <button
                                                         onClick={(e) => {
                                                             e.stopPropagation();
-                                                            removeFromCart(item.id);
+                                                            removeFromCart(item);
                                                         }}
                                                         disabled={disabled}
                                                         className="w-6 h-6 bg-white border border-gray-200 hover:bg-[#1B3A69] hover:text-white rounded-none text-gray-700 flex items-center justify-center transition-all shrink-0 font-mono text-xs font-black shadow-2xs disabled:cursor-not-allowed cursor-pointer"
@@ -712,9 +734,18 @@ export default function CartSidebar({
                                                     >
                                                         -
                                                     </button>
-                                                    <span className="w-8 text-center font-black text-gray-900 font-mono text-xs">
-                                                        {item.quantity}
-                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={(e) => {
+                                                            e.stopPropagation();
+                                                            if (!disabled && onEditItemQty) onEditItemQty(item);
+                                                        }}
+                                                        disabled={disabled}
+                                                        className="min-w-[5.5rem] px-1 text-center font-black text-gray-900 font-mono text-xs tabular-nums whitespace-nowrap underline decoration-dotted underline-offset-2 cursor-pointer disabled:cursor-not-allowed"
+                                                        title="Tap to type a quantity"
+                                                    >
+                                                        {formatQty(item.quantity)}
+                                                    </button>
                                                     <button
                                                         onClick={(e) => {
                                                             e.stopPropagation();
@@ -729,17 +760,17 @@ export default function CartSidebar({
                                                 </div>
                                             ) : (
                                                 <div className="flex items-center h-8 select-none relative px-2.5 text-xs font-black text-gray-500 bg-gray-100 border border-gray-200 rounded-none font-mono">
-                                                    QTY: <span className="text-gray-900 ml-1">{item.quantity}</span>
+                                                    QTY: <span className="text-gray-900 ml-1">{formatQty(item.quantity)}</span>
                                                 </div>
                                             )}
 
                                             {/* Right: Price details */}
                                             <div className="text-right">
-                                                <div className="text-[10px] font-bold text-gray-400 font-mono">
-                                                    {formatPrice(item.price)} × {item.quantity}
+                                                <div className="text-[11px] font-semibold text-gray-900 font-mono">
+                                                    {formatPrice(item.price)} × {formatQty(item.quantity)}
                                                 </div>
                                                 <div className="text-xs sm:text-sm font-black text-[#1B3B6A] font-mono mt-0.5">
-                                                    {formatPrice(item.price * item.quantity)}
+                                                    {formatPrice(lineAmount(item))}
                                                 </div>
                                             </div>
                                         </div>
@@ -792,7 +823,7 @@ export default function CartSidebar({
                                 if (shiftData && !shiftData.has_active_shift) {
                                     Swal.fire({
                                         title: 'No Active Work Shift',
-                                        text: 'Please open a work shift and record your starting float before checking out.',
+                                        text: 'Please open a work shift and record your starting cash before checking out.',
                                         icon: 'warning',
                                         confirmButtonColor: '#1B3A69',
                                         confirmButtonText: 'Open Shift Now',

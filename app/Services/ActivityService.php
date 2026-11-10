@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\ActivityLog;
 use App\Models\Store;
 use App\Models\User;
+use App\Support\Quantity;
 use App\Jobs\LogActivityJob;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Request;
@@ -312,20 +313,22 @@ class ActivityService
      */
     public static function logStockAdjust(
         int $productId,
-        int $quantityChanged,
+        $quantityChanged,
         ?string $description = null,
         ?int $storeId = null,
-        ?int $oldStock = null,
-        ?int $newStock = null
+        $oldStock = null,
+        $newStock = null,
+        ?string $unit = null
     ) {
         $operationKey = 'product.stock_adjust';
+        $quantityChanged = Quantity::toNumber($quantityChanged);
 
         // Auto-resolve stock levels from database if not explicitly provided
         if ($oldStock === null || $newStock === null) {
             $currentStock = \App\Models\Product::withoutGlobalScopes()->whereKey($productId)->value('stock_quantity');
             if ($currentStock !== null) {
-                $newStock = $newStock ?? (int) $currentStock;
-                $oldStock = $oldStock ?? max(0, $newStock - $quantityChanged);
+                $newStock = $newStock ?? Quantity::toNumber($currentStock);
+                $oldStock = $oldStock ?? Quantity::toNumber(Quantity::subtract($newStock, $quantityChanged));
             }
         }
 
@@ -339,6 +342,10 @@ class ActivityService
             'quantity_added' => $quantityChanged,
             'quantity_change' => $quantityChanged,
         ];
+
+        if ($unit) {
+            $newValues['unit'] = $unit;
+        }
 
         if ($storeId) {
             $newValues['store_id'] = $storeId;

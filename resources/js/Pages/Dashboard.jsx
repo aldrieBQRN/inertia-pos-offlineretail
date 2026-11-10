@@ -470,7 +470,7 @@ export default function Dashboard({ auth, initial_stats }) {
                                     {/* Cash Drawer Metrics Breakdown */}
                                     <div className="space-y-2 text-xs sm:text-sm">
                                         <div className="flex justify-between items-center py-1 border-b border-gray-100/80">
-                                            <span className="text-gray-500 font-medium">Opening Float:</span>
+                                            <span className="text-gray-500 font-medium">Starting Cash:</span>
                                             <span className="font-bold text-gray-800 font-mono">{formatCurrency(stats.active_shift.starting_cash)}</span>
                                         </div>
                                         <div className="flex justify-between items-center py-1 border-b border-gray-100/80">
@@ -478,7 +478,7 @@ export default function Dashboard({ auth, initial_stats }) {
                                             <span className="font-bold text-emerald-600 font-mono">+{formatCurrency(stats.active_shift.cash_sales)}</span>
                                         </div>
                                         <div className="flex justify-between items-center py-1 border-b border-gray-100/80">
-                                            <span className="text-gray-500 font-medium">Cash In (Float Top-up):</span>
+                                            <span className="text-gray-500 font-medium">Cash In (Cash Top-up):</span>
                                             <span className="font-bold text-blue-600 font-mono">+{formatCurrency(stats.active_shift.cash_in)}</span>
                                         </div>
                                         <div className="flex justify-between items-center py-1 border-b border-gray-100/80">

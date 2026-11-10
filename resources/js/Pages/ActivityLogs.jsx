@@ -47,6 +47,11 @@ const ACTION_LABELS = {
     deleted: 'Deleted',
     restocked: 'Stock Added',
     stock_adjusted: 'Stock Adjusted',
+    stock_adjust: 'Stock Adjusted',
+    stock_void_return: 'Stock Returned (Void)',
+    import: 'Inventory Import',
+    import_failed: 'Import Rejected',
+    export: 'Inventory Export',
     price_change: 'Price Updated',
     sale_completed: 'POS Sale',
     sale_voided: 'Sale Voided',
@@ -58,7 +63,7 @@ const ACTION_LABELS = {
     shift_open: 'Shift Started',
     shift_close: 'Shift Closed',
     'cash_movement.create': 'Cash Movement',
-    cash_in: 'Cash In / Float',
+    cash_in: 'Cash In',
     cash_out: 'Cash Out / Payout',
     status_toggle: 'Status Changed',
     password_changed: 'Password Changed',
@@ -122,7 +127,7 @@ const FIELD_LABELS = {
     cash_given: 'Cash Tendered',
     change: 'Change Given',
     payment_method: 'Payment Channel',
-    starting_cash: 'Starting Cash Float',
+    starting_cash: 'Starting Cash',
     actual_cash: 'Actual Cash Count',
     expected_cash: 'Expected Drawer Balance',
     difference: 'Cash Variance (Short/Over)',
@@ -142,7 +147,44 @@ const FIELD_LABELS = {
     expected_opening_cash: 'Expected Opening Cash',
     discrepancy: 'Opening Discrepancy',
     total_sales: 'Total Sales',
-    transactions_count: 'Transactions'
+    transactions_count: 'Transactions',
+    // Multiple UOM
+    selling_method: 'Selling Method',
+    base_unit: 'Base Unit',
+    units: 'Selling Units',
+    unit: 'Stock Unit',
+    // Inventory import / export
+    file_name: 'File',
+    rows: 'Product Rows in File',
+    units_rows: 'Unit Rows in File',
+    new_products: 'New Products',
+    updated_products: 'Updated Products',
+    skipped_products: 'Skipped Products',
+    stock_changes: 'Stock Changes',
+    existing_products: 'Existing Products',
+    update_stock: 'Update Stock from File',
+    errors: 'Problems Found',
+    export_type: 'Export Type',
+    records: 'Records Exported',
+    selling_units: 'Selling Units Exported',
+    filters: 'Filters',
+    product: 'Product'
+};
+
+const EXPORT_TYPE_LABELS = {
+    inventory_excel: 'Inventory (Excel)',
+    inventory_pdf: 'Inventory Report (PDF)',
+    stock_ledger_excel: 'Product Stock Ledger (Excel)',
+    activity_excel: 'Inventory Activity Feed (Excel)'
+};
+
+const formatQty = (value) => Number(value).toLocaleString('en-US', { maximumFractionDigits: 4 });
+
+/** Unit for stock quantities in a log: the Multiple UOM base unit when recorded, else "units". */
+const logStockUnit = (log) => {
+    const n = log?.new_values || {};
+    const o = log?.old_values || {};
+    return n.unit || n.base_unit || o.base_unit || 'units';
 };
 
 // Internal technical & CRM fields to exclude from Store Admin view
@@ -161,7 +203,7 @@ const MOVEMENT_TYPE_LABELS = {
     cash_out: 'Cash Out / Expense',
     owner_draw: 'Owner Withdrawal',
     safe_drop: 'Safe Drop',
-    float_topup: 'Float Top-up',
+    float_topup: 'Cash Top-up',
     expense: 'Expense'
 };
 
@@ -208,7 +250,8 @@ const ImagePreview = ({ src }) => {
 };
 
 // Helper to format values cleanly without developer clutter
-const formatAdminValue = (key, value) => {
+const formatAdminValue = (key, value, ctx = {}) => {
+    const unit = ctx.unit || 'units';
     if (key === 'image_path' && (value === null || value === undefined || value === '')) {
         return <span className="text-xs font-semibold text-gray-500 italic font-sans">No image</span>;
     }
@@ -239,15 +282,43 @@ const formatAdminValue = (key, value) => {
             return <span className="text-gray-400 font-sans font-medium">—</span>;
         }
         return (
-            <span className="inline-flex items-center px-2 py-0.5 rounded-none text-[11px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200 font-sans">
-                {num > 0 ? `+${num}` : num} units
+            <span className={`inline-flex items-center px-2 py-0.5 rounded-none text-[11px] font-black border font-sans ${num > 0 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' : 'bg-rose-50 text-rose-700 border-rose-200'}`}>
+                {num > 0 ? `+${formatQty(num)}` : formatQty(num)} {unit}
             </span>
         );
     }
 
     // Stock quantities
     if (key === 'stock_quantity' || key === 'stock') {
-        return <span className="font-bold text-gray-900 font-sans">{Number(value).toLocaleString()} units</span>;
+        return <span className="font-bold text-gray-900 font-sans">{formatQty(value)} {unit}</span>;
+    }
+
+    // Yes / No flags (checked before the generic Active / Inactive boolean)
+    if (key === 'update_stock') {
+        const yes = value === true || value === 1 || value === '1';
+        return (
+            <span className={`inline-flex items-center px-2 py-0.5 rounded-none text-[11px] font-bold ${yes ? 'bg-amber-50 text-amber-800' : 'bg-gray-100 text-gray-600'}`}>
+                {yes ? 'Yes' : 'No (stock kept)'}
+            </span>
+        );
+    }
+
+    if (key === 'export_type') {
+        return <span className="text-xs font-semibold text-gray-800 font-sans">{EXPORT_TYPE_LABELS[value] || String(value)}</span>;
+    }
+
+    // Lists (selling units, import problems)
+    if (Array.isArray(value)) {
+        if (value.length === 0) {
+            return <span className="text-gray-400 font-sans italic">None</span>;
+        }
+        return (
+            <ul className="text-xs font-semibold text-gray-800 font-sans space-y-0.5 list-disc pl-4">
+                {value.map((item, i) => (
+                    <li key={i}>{typeof item === 'object' ? JSON.stringify(item) : String(item)}</li>
+                ))}
+            </ul>
+        );
     }
 
     // Booleans
@@ -1648,17 +1719,18 @@ export default function ActivityLogs() {
                                                                         {friendlyLabel}
                                                                     </td>
                                                                     <td className="py-2.5 px-3.5 bg-rose-50/20">
-                                                                        {formatAdminValue(key, oldVal)}
+                                                                        {formatAdminValue(key, oldVal, { unit: logStockUnit(selectedLogForModal) })}
                                                                     </td>
                                                                     <td className="py-2.5 px-3.5 bg-emerald-50/20">
                                                                         <div className="flex items-center gap-2 flex-wrap">
-                                                                            {formatAdminValue(key, newVal)}
+                                                                            {formatAdminValue(key, newVal, { unit: logStockUnit(selectedLogForModal) })}
                                                                             {(key === 'stock_quantity' || key === 'stock') && (() => {
                                                                                 const added = Number(newV.quantity_added ?? newV.quantity_change);
-                                                                                if (!added || isNaN(added) || added <= 0) return null;
+                                                                                if (!added || isNaN(added)) return null;
+                                                                                const unitLabel = logStockUnit(selectedLogForModal);
                                                                                 return (
-                                                                                    <span className="inline-flex items-center px-1.5 py-0.5 rounded-none text-[10px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300 font-sans shadow-2xs">
-                                                                                        +{added.toLocaleString()} added
+                                                                                    <span className={`inline-flex items-center px-1.5 py-0.5 rounded-none text-[10px] font-black border font-sans shadow-2xs ${added > 0 ? 'bg-emerald-100 text-emerald-800 border-emerald-300' : 'bg-rose-100 text-rose-800 border-rose-300'}`}>
+                                                                                        {added > 0 ? `+${formatQty(added)} ${unitLabel} added` : `${formatQty(added)} ${unitLabel} removed`}
                                                                                     </span>
                                                                                 );
                                                                             })()}
@@ -1705,13 +1777,14 @@ export default function ActivityLogs() {
                                                     <div key={key} className="bg-gray-50/80 p-3 rounded-none border border-gray-200/60 flex flex-col justify-between">
                                                         <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">{friendlyLabel}</span>
                                                         <span className="text-xs font-black text-gray-900 mt-1 break-words flex items-center gap-2 flex-wrap">
-                                                            {formatAdminValue(key, value)}
+                                                            {formatAdminValue(key, value, { unit: logStockUnit(selectedLogForModal) })}
                                                             {(key === 'stock_quantity' || key === 'stock') && (() => {
                                                                 const added = Number(detailsObj.quantity_added ?? detailsObj.quantity_change);
-                                                                if (!added || isNaN(added) || added <= 0) return null;
+                                                                if (!added || isNaN(added)) return null;
+                                                                const unitLabel = logStockUnit(selectedLogForModal);
                                                                 return (
-                                                                    <span className="inline-flex items-center px-1.5 py-0.5 rounded-none text-[10px] font-black bg-emerald-100 text-emerald-800 border border-emerald-300 font-sans shadow-2xs">
-                                                                        +{added.toLocaleString()} added
+                                                                    <span className={`inline-flex items-center px-1.5 py-0.5 rounded-none text-[10px] font-black border font-sans shadow-2xs ${added > 0 ? 'bg-emerald-100 text-emerald-800 border-emerald-300' : 'bg-rose-100 text-rose-800 border-rose-300'}`}>
+                                                                        {added > 0 ? `+${formatQty(added)} ${unitLabel} added` : `${formatQty(added)} ${unitLabel} removed`}
                                                                     </span>
                                                                 );
                                                             })()}

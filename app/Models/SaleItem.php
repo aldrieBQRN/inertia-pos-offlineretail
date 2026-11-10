@@ -2,7 +2,9 @@
 
 namespace App\Models;
 
+use App\Support\Quantity;
 use App\Traits\BelongsToStore;
+use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
@@ -17,6 +19,7 @@ class SaleItem extends Model
 
     protected $appends = [
         'display_name',
+        'display_unit',
     ];
 
     /**
@@ -29,11 +32,43 @@ class SaleItem extends Model
     protected $fillable = [
         'sale_id',
         'product_id',
+        'product_unit_id',
         'custom_name',
+        'unit_name',
+        'conversion_factor',
+        'base_quantity',
         'quantity',
         'unit_price',
+        'cost_price_snapshot',
         'subtotal',
     ];
+
+    protected $casts = [
+        'unit_price' => 'integer',
+        'cost_price_snapshot' => 'integer',
+        'subtotal' => 'integer',
+    ];
+
+    protected function quantity(): Attribute
+    {
+        return Attribute::make(
+            get: fn ($value) => Quantity::toNumber($value)
+        );
+    }
+
+    protected function baseQuantity(): Attribute
+    {
+        return Attribute::make(
+            get: fn ($value) => $value === null ? null : Quantity::toNumber($value)
+        );
+    }
+
+    protected function conversionFactor(): Attribute
+    {
+        return Attribute::make(
+            get: fn ($value) => $value === null ? null : Quantity::toNumber($value)
+        );
+    }
 
     /**
      * Relationship: Each line item belongs to a parent Sale (Receipt).
@@ -53,6 +88,16 @@ class SaleItem extends Model
     public function product()
     {
         return $this->belongsTo(Product::class);
+    }
+
+    public function productUnit()
+    {
+        return $this->belongsTo(ProductUnit::class);
+    }
+
+    public function getDisplayUnitAttribute(): ?string
+    {
+        return $this->unit_name ?: null;
     }
 
     /**

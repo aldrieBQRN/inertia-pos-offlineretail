@@ -270,7 +270,7 @@ export default function ShiftModal({ isOpen, settings, onClose, onShiftCompleted
                                 </div>
 
                                 <div className="flex justify-between items-center text-gray-600">
-                                    <span className="font-medium">Starting Cash Float</span>
+                                    <span className="font-medium">Starting Cash</span>
                                     <span className="font-bold text-gray-800 font-mono">{formatCurrency(summary.starting_cash)}</span>
                                 </div>
 
@@ -281,7 +281,7 @@ export default function ShiftModal({ isOpen, settings, onClose, onShiftCompleted
 
                                 {Number(summary.cash_in || 0) > 0 && (
                                     <div className="flex justify-between items-center text-emerald-600">
-                                        <span className="font-medium">+ Cash In / Float Top-up</span>
+                                        <span className="font-medium">+ Cash In / Cash Top-up</span>
                                         <span className="font-black font-mono">+{formatCurrency(summary.cash_in)}</span>
                                     </div>
                                 )}

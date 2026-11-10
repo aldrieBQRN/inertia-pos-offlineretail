@@ -1,0 +1,162 @@
+name: 🚀 Deploy Multiple UOM preview to InfinityFree
+
+# Separate site from the demo: pushes to feature/multiple-uom deploy to a subdomain
+# with its own database. Site-specific secrets live in the GitHub Environment
+# "multiple-uom" (APP_URL, APP_KEY, DB_DATABASE, MIGRATE_TOKEN, FTP_SERVER_DIR);
+# FTP_HOST/FTP_USERNAME/FTP_PASSWORD/DB_HOST/DB_USERNAME/DB_PASSWORD fall back to
+# the repository secrets already used by the demo deployment.
+
+on:
+  push:
+    branches: [feature/multiple-uom]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-infinityfree-multiple-uom
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: ⚡ Build Assets & Deploy (Multiple UOM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: multiple-uom
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build frontend assets (Vite)
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Check required secrets
+        env:
+          APP_URL:        ${{ secrets.APP_URL }}
+          APP_KEY:        ${{ secrets.APP_KEY }}
+          DB_DATABASE:    ${{ secrets.DB_DATABASE }}
+          MIGRATE_TOKEN:  ${{ secrets.MIGRATE_TOKEN }}
+          FTP_SERVER_DIR: ${{ secrets.FTP_SERVER_DIR }}
+        run: |
+          missing=0
+          for name in APP_URL APP_KEY DB_DATABASE MIGRATE_TOKEN FTP_SERVER_DIR; do
+            if [ -z "${!name}" ]; then echo "::error::Secret $name is not set in the 'multiple-uom' environment"; missing=1; fi
+          done
+          case "$FTP_SERVER_DIR" in
+            /htdocs/|/htdocs) echo "::error::FTP_SERVER_DIR must be the subdomain folder, not /htdocs/ (that is the demo site)"; missing=1 ;;
+          esac
+          exit $missing
+
+      - name: Create production .env
+        env:
+          APP_KEY:        ${{ secrets.APP_KEY }}
+          APP_URL:        ${{ secrets.APP_URL }}
+          DB_HOST:        ${{ secrets.DB_HOST }}
+          DB_DATABASE:    ${{ secrets.DB_DATABASE }}
+          DB_USERNAME:    ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD:    ${{ secrets.DB_PASSWORD }}
+          MIGRATE_TOKEN:  ${{ secrets.MIGRATE_TOKEN }}
+        run: |
+          cat > .env << EOF
+          APP_NAME="Inertia POS (Multiple UOM)"
+          APP_ENV=production
+          APP_KEY=${APP_KEY}
+          APP_DEBUG=true
+          APP_URL=${APP_URL}
+          APP_DEMO_MODE=true
+          APP_TIMEZONE=Asia/Manila
+
+          APP_LOCALE=en
+          APP_FALLBACK_LOCALE=en
+          APP_MAINTENANCE_DRIVER=file
+          BCRYPT_ROUNDS=10
+
+          LOG_CHANNEL=single
+          LOG_LEVEL=debug
+
+          DB_CONNECTION=mysql
+          DB_HOST=${DB_HOST}
+          DB_PORT=3306
+          DB_DATABASE=${DB_DATABASE}
+          DB_USERNAME=${DB_USERNAME}
+          DB_PASSWORD=${DB_PASSWORD}
+
+          SESSION_DRIVER=file
+          SESSION_LIFETIME=120
+          SESSION_ENCRYPT=false
+          SESSION_PATH=/
+          SESSION_DOMAIN=null
+
+          BROADCAST_CONNECTION=log
+          FILESYSTEM_DISK=local
+          QUEUE_CONNECTION=sync
+          CACHE_STORE=file
+          AUDIT_QUEUE_ENABLED=false
+          MAIL_MAILER=log
+
+          VITE_APP_NAME="Inertia POS (Multiple UOM)"
+          MIGRATE_TOKEN=${MIGRATE_TOKEN}
+          EOF
+
+      - name: Prepare runtime folders and migration runner
+        run: |
+          # Laravel needs these folders to exist and be writable on the server.
+          # (.gitignore placeholders are excluded from upload, so add .keep files.)
+          for d in storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs storage/app/public bootstrap/cache; do
+            mkdir -p "$d" && touch "$d/.keep"
+          done
+          # Browser migration runner (token protected) — InfinityFree has no SSH
+          cp deploy/infinityfree/migrate.php public/migrate.php
+
+      - name: Deploy app code via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server:      ${{ secrets.FTP_HOST }}
+          username:    ${{ secrets.FTP_USERNAME }}
+          password:    ${{ secrets.FTP_PASSWORD }}
+          local-dir:   ./
+          server-dir:  ${{ secrets.FTP_SERVER_DIR }}
+          protocol:    ftp
+          port:        21
+          timeout:     60000
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/vendor/**
+            **/node_modules/**
+            **/tests/**
+            **/e2e/**
+            **/playwright*
+            **/.agents/**
+            **/.claude/**
+            **/deploy/**
+            **/phpunit.xml
+            **/.env.mysql-backup
+            **/.env.example
+            **/.env.infinityfree.example
+            **/env.txt
+            **/app.env
+            **/storage/pail/**
+            **/*.bat
+            **/*.exe
+            **/*.pdf
+            **/packaging/**
+            **/documentation/**
+            **/zip_vendor.php
+            **/php_errors.log
+            **/jsconfig.json
+
+      - name: ✅ Deployment summary
+        run: |
+          echo "✅ Deployed feature/multiple-uom to ${{ secrets.FTP_SERVER_DIR }}"
+          echo "First deploy? Open <APP_URL>/migrate.php?token=<MIGRATE_TOKEN>&action=migrate"

@@ -132,7 +132,7 @@ export default function OpenShiftModal({ isOpen, onClose, onShiftOpened, shiftIn
         if (loading) return;
 
         if (enteredAmount < 0) {
-            Swal.fire('Invalid Amount', 'Starting float cannot be negative.', 'warning');
+            Swal.fire('Invalid Amount', 'Starting cash cannot be negative.', 'warning');
             return;
         }
 
@@ -147,7 +147,7 @@ export default function OpenShiftModal({ isOpen, onClose, onShiftOpened, shiftIn
             Swal.fire({
                 icon: 'success',
                 title: 'Shift Opened',
-                text: `Starting float of ${formatCurrency(enteredAmount)} recorded for ${terminal?.name || 'Register'}.`,
+                text: `Starting cash of ${formatCurrency(enteredAmount)} recorded for ${terminal?.name || 'Register'}.`,
                 timer: 1800,
                 showConfirmButton: false
             });
@@ -213,7 +213,7 @@ export default function OpenShiftModal({ isOpen, onClose, onShiftOpened, shiftIn
                             <h2 className="text-base sm:text-lg font-black text-white tracking-tight flex items-center gap-2">
                                 Open Work Shift
                             </h2>
-                            <p className="text-xs text-blue-200 font-medium">Verify drawer float before selling</p>
+                            <p className="text-xs text-blue-200 font-medium">Count your starting cash before selling</p>
                         </div>
                     </div>
                     <button
@@ -231,7 +231,7 @@ export default function OpenShiftModal({ isOpen, onClose, onShiftOpened, shiftIn
                 {/* Form Body */}
                 <form onSubmit={handleSubmit} className="p-5 sm:p-6 overflow-y-auto custom-scrollbar space-y-4 bg-white">
                     
-                    {/* Expected Float & Recent Movement Card */}
+                    {/* Expected Starting Cash & Recent Movement Card */}
                     <div className="bg-gray-50 p-3.5 sm:p-4 rounded-none border border-gray-200/80 space-y-2.5">
                         {terminal && (
                             <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-1.5 pb-2.5 border-b border-gray-200/60">
@@ -308,7 +308,7 @@ export default function OpenShiftModal({ isOpen, onClose, onShiftOpened, shiftIn
                             />
                         </div>
 
-                        {/* Quick Float Presets — Tablet & Mobile horizontal slider, hidden on Laptop/Desktop */}
+                        {/* Quick Starting Cash Presets — Tablet & Mobile horizontal slider, hidden on Laptop/Desktop */}
                         <div className="flex lg:hidden items-center gap-1.5 pt-1 overflow-x-auto custom-scrollbar-none pb-0.5 select-none">
                             <span className="text-[10px] font-bold text-gray-400 uppercase tracking-wider shrink-0 mr-0.5">Presets:</span>
                             {[500, 1000, 2000, 3000, 5000].map((amt) => (
@@ -336,7 +336,7 @@ export default function OpenShiftModal({ isOpen, onClose, onShiftOpened, shiftIn
                             <p className="text-[11px] opacity-90 leading-relaxed">
                                 {discrepancy < 0 
                                     ? "Physical count is less than expected. This difference will be recorded as an Opening Handover Discrepancy and will NOT be deducted from your sales accountability."
-                                    : "Physical count is higher than expected. This excess float is recorded as an Opening Overage."}
+                                    : "Physical count is higher than expected. This excess cash is recorded as an Opening Overage."}
                             </p>
                         </div>
                     )}

@@ -148,7 +148,7 @@ class ShiftController extends Controller
     }
 
     /**
-     * Open a new shift with counted starting float.
+     * Open a new shift with counted starting cash.
      */
     public function open(Request $request)
     {
@@ -241,7 +241,7 @@ class ShiftController extends Controller
                     'shift.open',
                     'Shift',
                     $shift->id,
-                    "Opened shift #{$shift->id} with starting float ₱" . number_format($startingCash, 2),
+                    "Opened shift #{$shift->id} with starting cash ₱" . number_format($startingCash, 2),
                     null,
                     [
                         'starting_cash' => $startingCash,

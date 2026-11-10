@@ -8,6 +8,7 @@ use App\Models\SaleItem;
 use App\Models\Product;
 use App\Models\Shift;
 use App\Models\ActivityLog;
+use App\Support\Quantity;
 use Illuminate\Http\Request;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -42,7 +43,7 @@ class DashboardController extends Controller
             ->where('sales.store_id', $storeId)
             ->where('sales.status', '!=', 'void')
             ->whereBetween('sales.created_at', [$today, $endOfToday])
-            ->sum(DB::raw('(sale_items.unit_price - COALESCE(products.cost_price, 0)) * sale_items.quantity'));
+            ->sum(DB::raw('(sale_items.unit_price * sale_items.quantity) - (COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity))'));
 
         $todayDiscounts = (int) Sale::where('store_id', $storeId)
             ->where('status', '!=', 'void')
@@ -63,7 +64,7 @@ class DashboardController extends Controller
             ->where('sales.store_id', $storeId)
             ->where('sales.status', '!=', 'void')
             ->whereBetween('sales.created_at', [$yesterday, $endOfYesterday])
-            ->sum(DB::raw('(sale_items.unit_price - COALESCE(products.cost_price, 0)) * sale_items.quantity'));
+            ->sum(DB::raw('(sale_items.unit_price * sale_items.quantity) - (COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity))'));
 
         $yesterdayDiscounts = (int) Sale::where('store_id', $storeId)
             ->where('status', '!=', 'void')
@@ -121,7 +122,7 @@ class DashboardController extends Controller
                 ->where('sales.status', '!=', 'void')
                 ->select(
                     'sales.created_at',
-                    DB::raw('(sale_items.unit_price - COALESCE(products.cost_price, 0)) * sale_items.quantity as item_profit')
+                    DB::raw('(sale_items.unit_price * sale_items.quantity) - (COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity)) as item_profit')
                 )
                 ->get();
 
@@ -173,7 +174,7 @@ class DashboardController extends Controller
                 ->whereBetween('sales.created_at', [$trendStart, $endOfToday])
                 ->select(
                     DB::raw('DATE(sales.created_at) as date'),
-                    DB::raw('SUM((sale_items.unit_price - COALESCE(products.cost_price, 0)) * sale_items.quantity) as item_profit')
+                    DB::raw('SUM((sale_items.unit_price * sale_items.quantity) - (COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity))) as item_profit')
                 )
                 ->groupBy('date')
                 ->get()
@@ -215,7 +216,7 @@ class DashboardController extends Controller
                 ->whereBetween('sales.created_at', [$monthStart, $endOfToday])
                 ->select(
                     DB::raw('DATE(sales.created_at) as date'),
-                    DB::raw('SUM((sale_items.unit_price - COALESCE(products.cost_price, 0)) * sale_items.quantity) as item_profit')
+                    DB::raw('SUM((sale_items.unit_price * sale_items.quantity) - (COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity))) as item_profit')
                 )
                 ->groupBy('date')
                 ->get()
@@ -298,18 +299,24 @@ class DashboardController extends Controller
         $outOfStockItems = Product::where('store_id', $storeId)
             ->where('is_active', true)
             ->where('stock_quantity', '<=', 0)
-            ->with('category')
+            ->with(['category', 'units'])
             ->orderBy('name')
             ->limit(5)
             ->get()
             ->map(function ($p) {
+                $defaultUnit = $p->selling_method === Product::SELLING_METHOD_MULTIPLE ? $p->defaultUnit() : null;
+
                 return [
                     'id' => $p->id,
                     'name' => $p->name,
                     'sku' => $p->sku,
                     'category_name' => $p->category ? $p->category->name : 'Uncategorized',
                     'stock_quantity' => $p->stock_quantity,
-                    'price' => $p->price / 100,
+                    'base_unit' => $p->base_unit,
+                    'is_multi_unit' => $p->selling_method === Product::SELLING_METHOD_MULTIPLE,
+                    'price' => $defaultUnit
+                        ? $defaultUnit->price / 100
+                        : ($p->price !== null ? $p->price / 100 : 0),
                     'status' => 'out_of_stock'
                 ];
             });
@@ -318,18 +325,24 @@ class DashboardController extends Controller
             ->where('is_active', true)
             ->where('stock_quantity', '>', 0)
             ->whereRaw('stock_quantity <= COALESCE(low_stock_threshold, 10)')
-            ->with('category')
+            ->with(['category', 'units'])
             ->orderBy('stock_quantity', 'asc')
             ->limit(5)
             ->get()
             ->map(function ($p) {
+                $defaultUnit = $p->selling_method === Product::SELLING_METHOD_MULTIPLE ? $p->defaultUnit() : null;
+
                 return [
                     'id' => $p->id,
                     'name' => $p->name,
                     'sku' => $p->sku,
                     'category_name' => $p->category ? $p->category->name : 'Uncategorized',
                     'stock_quantity' => $p->stock_quantity,
-                    'price' => $p->price / 100,
+                    'base_unit' => $p->base_unit,
+                    'is_multi_unit' => $p->selling_method === Product::SELLING_METHOD_MULTIPLE,
+                    'price' => $defaultUnit
+                        ? $defaultUnit->price / 100
+                        : ($p->price !== null ? $p->price / 100 : 0),
                     'status' => 'low_stock'
                 ];
             });
@@ -351,8 +364,8 @@ class DashboardController extends Controller
                 'products.name',
                 'products.sku',
                 'categories.name as category_name',
-                DB::raw('SUM(sale_items.quantity) as units_sold'),
-                DB::raw('SUM(sale_items.unit_price * sale_items.quantity) as total_revenue')
+                DB::raw('SUM(COALESCE(sale_items.base_quantity, sale_items.quantity)) as units_sold'),
+                DB::raw('SUM(sale_items.subtotal) as total_revenue')
             )
             ->groupBy('products.id', 'products.name', 'products.sku', 'categories.name')
             ->orderByDesc('units_sold')
@@ -366,7 +379,7 @@ class DashboardController extends Controller
                     'name' => $tp->name,
                     'sku' => $tp->sku,
                     'category_name' => $tp->category_name ?? 'General',
-                    'units_sold' => (int) $tp->units_sold,
+                    'units_sold' => Quantity::toNumber($tp->units_sold),
                     'total_revenue' => ((int) $tp->total_revenue) / 100,
                 ];
             });

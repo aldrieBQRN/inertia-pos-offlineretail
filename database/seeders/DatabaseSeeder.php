@@ -10,9 +10,12 @@ class DatabaseSeeder extends Seeder
      * Standalone install: the store and the Admin account are created by the
      * First-Time Setup screen, so the default seeder intentionally creates nothing.
      *
-     * Optional sample catalog (run after setup):
-     *   php artisan db:seed --class=ProductSeeder
-     *   php artisan db:seed --class=GrocerySeeder   (replaces the catalog and deletes all sales)
+     * Full demo store (replaces ALL store data: users, products, sales, shifts, logs;
+     * the license is kept). Includes Multiple UOM products, 14 days of shifts and sales:
+     *   php artisan db:seed --class=DemoSeeder        (login PIN 1234)
+     *
+     * Remove only sales and shifts (keeps products, stock and users):
+     *   php artisan db:seed --class=ClearTransactionsAndShiftsSeeder
      */
     public function run(): void
     {

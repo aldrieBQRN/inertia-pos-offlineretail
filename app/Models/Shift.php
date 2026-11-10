@@ -8,7 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 
 /**
  * Shift Model
- * * Tracks cashier work sessions, including starting float,
+ * * Tracks cashier work sessions, including starting cash,
  * total sales, and final cash reconciliation (overages/shortages).
  */
 class Shift extends Model

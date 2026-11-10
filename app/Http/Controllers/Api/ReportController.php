@@ -10,6 +10,7 @@ use App\Models\Category;
 use App\Models\Shift;
 use App\Models\CashMovement;
 use App\Models\Store;
+use App\Support\Quantity;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
@@ -94,14 +95,14 @@ class ReportController extends Controller
                 $q->where('products.category_id', $categoryId);
             })
             ->selectRaw('
-                SUM(sale_items.quantity) as total_units_sold,
+                SUM(COALESCE(sale_items.base_quantity, sale_items.quantity)) as total_units_sold,
                 SUM(sale_items.subtotal) as total_gross_items_revenue,
-                SUM(COALESCE(products.cost_price, 0) * sale_items.quantity) as total_cogs
+                SUM(COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity)) as total_cogs
             ')
             ->first();
 
-        $totalUnitsSold = (int)($itemProfitsRaw->total_units_sold ?? 0);
-        $totalCogsCents = (int)($itemProfitsRaw->total_cogs ?? 0);
+        $totalUnitsSold = Quantity::toNumber($itemProfitsRaw->total_units_sold ?? 0);
+        $totalCogsCents = (int) round((float) ($itemProfitsRaw->total_cogs ?? 0));
         $totalGrossProfitCents = $totalSalesCents - $totalCogsCents - $totalDiscountsCents;
         $grossMarginPct = $totalSalesCents > 0 ? round(($totalGrossProfitCents / $totalSalesCents) * 100, 1) : 0;
 
@@ -214,12 +215,16 @@ class ReportController extends Controller
                 MAX(COALESCE(categories.name, \'Uncategorized\')) as category_name,
                 MAX(COALESCE(categories.id, 0)) as category_id,
                 MAX(COALESCE(products.price, sale_items.unit_price)) as unit_retail_price,
-                MAX(COALESCE(products.cost_price, 0)) as unit_cost_price,
+                MAX(COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0)) as unit_cost_price,
                 MAX(COALESCE(products.stock_quantity, 0)) as current_stock,
                 MAX(COALESCE(products.is_active, 1)) as is_active,
-                SUM(sale_items.quantity) as units_sold,
+                MAX(CASE WHEN products.selling_method = \'multiple\' THEN 1 ELSE 0 END) as is_multi_unit,
+                MAX(COALESCE(products.base_unit, \'\')) as base_unit,
+                MAX(products.quantity_decimals) as quantity_decimals,
+                MAX(CASE WHEN products.id IS NOT NULL AND COALESCE(sale_items.cost_price_snapshot, products.cost_price) IS NULL THEN 1 ELSE 0 END) as has_missing_cost,
+                SUM(COALESCE(sale_items.base_quantity, sale_items.quantity)) as units_sold,
                 SUM(sale_items.subtotal) as total_revenue,
-                SUM(COALESCE(products.cost_price, 0) * sale_items.quantity) as total_cost
+                SUM(COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity)) as total_cost
             ')
             ->groupBy('sale_items.product_id')
             ->orderByDesc('units_sold')
@@ -227,25 +232,44 @@ class ReportController extends Controller
 
         $productReports = $productSalesRaw->map(function ($p) {
             $rev = (int)$p->total_revenue;
-            $cost = (int)$p->total_cost;
+            $cost = (int) round((float)$p->total_cost);
             $profit = $rev - $cost;
             $margin = $rev > 0 ? round(($profit / $rev) * 100, 1) : 0;
+            $unitsSold = Quantity::toNumber($p->units_sold ?? 0);
+            $isMulti = (bool) $p->is_multi_unit;
+
+            // Multi-UOM reports express catalogue prices per base unit so they can
+            // be compared directly with the base-unit units_sold figure.
+            $unitRetail = $isMulti && Quantity::compare($unitsSold, '0') > 0
+                ? Quantity::toInt(Quantity::divide($rev, $unitsSold))
+                : (int) $p->unit_retail_price;
+            $unitCost = Quantity::compare($unitsSold, '0') > 0
+                ? Quantity::toInt(Quantity::divide($cost, $unitsSold))
+                : (int) $p->unit_cost_price;
+
             return [
                 'product_id' => $p->product_id,
                 'name' => $p->product_name,
                 'sku' => $p->sku,
                 'category_name' => $p->category_name,
                 'category_id' => (int)$p->category_id,
-                'unit_retail_price' => (int)$p->unit_retail_price,
-                'unit_cost_price' => (int)$p->unit_cost_price,
-                'current_stock' => (int)$p->current_stock,
+                'unit_retail_price' => $unitRetail,
+                'unit_cost_price' => $unitCost,
+                'current_stock' => Quantity::toNumber($p->current_stock ?? 0),
                 'is_active' => (bool)$p->is_active,
-                'units_sold' => (int)$p->units_sold,
+                'selling_method' => $isMulti ? 'multiple' : 'standard',
+                'is_multi_unit' => $isMulti,
+                'base_unit' => $p->base_unit ?: null,
+                'quantity_precision' => $isMulti
+                    ? ($p->quantity_decimals !== null ? (int) $p->quantity_decimals : Product::defaultQuantityDecimals($p->base_unit))
+                    : 0,
+                'has_missing_cost' => (bool) $p->has_missing_cost,
+                'units_sold' => $unitsSold,
                 'total_revenue' => $rev,
                 'total_cost' => $cost,
                 'total_profit' => $profit,
                 'margin_percent' => $margin,
-                'velocity_status' => (int)$p->units_sold >= 20 ? 'fast' : ((int)$p->units_sold <= 2 ? 'slow' : 'regular'),
+                'velocity_status' => Quantity::compare($unitsSold, '20') >= 0 ? 'fast' : (Quantity::compare($unitsSold, '2') <= 0 ? 'slow' : 'regular'),
             ];
         });
 
@@ -263,9 +287,9 @@ class ReportController extends Controller
                 COALESCE(categories.id, 0) as category_id,
                 MAX(COALESCE(categories.name, \'Uncategorized\')) as category_name,
                 COUNT(DISTINCT sale_items.product_id) as unique_products_sold,
-                SUM(sale_items.quantity) as units_sold,
+                SUM(COALESCE(sale_items.base_quantity, sale_items.quantity)) as units_sold,
                 SUM(sale_items.subtotal) as total_revenue,
-                SUM(COALESCE(products.cost_price, 0) * sale_items.quantity) as total_cost
+                SUM(COALESCE(sale_items.cost_price_snapshot, products.cost_price, 0) * COALESCE(sale_items.base_quantity, sale_items.quantity)) as total_cost
             ')
             ->groupBy(DB::raw('COALESCE(categories.id, 0)'))
             ->orderByDesc('total_revenue')
@@ -273,13 +297,13 @@ class ReportController extends Controller
 
         $categoryBreakdown = $categoryBreakdownRaw->map(function ($c) use ($totalSalesCents) {
             $rev = (int)$c->total_revenue;
-            $cost = (int)$c->total_cost;
+            $cost = (int) round((float)$c->total_cost);
             $profit = $rev - $cost;
             return [
                 'category_id' => $c->category_id,
                 'name' => $c->category_name,
                 'unique_products_sold' => (int)$c->unique_products_sold,
-                'units_sold' => (int)$c->units_sold,
+                'units_sold' => Quantity::toNumber($c->units_sold ?? 0),
                 'total_revenue' => $rev,
                 'total_cost' => $cost,
                 'total_profit' => $profit,
@@ -291,7 +315,7 @@ class ReportController extends Controller
         // DOMAIN 3: INVENTORY HEALTH & STOCK VALUATION
         // ---------------------------------------------------------------------
         $productsCatalog = Product::where('store_id', $storeId)
-            ->with('category')
+            ->with(['category', 'units'])
             ->when($categoryId, fn($q) => $q->where('category_id', $categoryId))
             ->when($search, function ($q) use ($search) {
                 $q->where(function ($sub) use ($search) {
@@ -303,7 +327,7 @@ class ReportController extends Controller
             ->get();
 
         $inventoryTotalSkus = $productsCatalog->count();
-        $inventoryTotalUnits = 0;
+        $inventoryTotalUnits = '0';
         $inventoryTotalCostValue = 0;
         $inventoryTotalRetailValue = 0;
         $inventoryTotalWholesaleValue = 0;
@@ -311,6 +335,7 @@ class ReportController extends Controller
         $lowStockCount = 0;
         $outOfStockCount = 0;
         $archivedItemsCount = 0;
+        $missingCostItemsCount = 0;
 
         $inventoryItems = $productsCatalog->map(function ($item) use (
             &$inventoryTotalUnits,
@@ -320,23 +345,41 @@ class ReportController extends Controller
             &$healthyStockCount,
             &$lowStockCount,
             &$outOfStockCount,
-            &$archivedItemsCount
+            &$archivedItemsCount,
+            &$missingCostItemsCount
         ) {
-            $qty = (int)$item->stock_quantity;
-            $cost = (int)($item->cost_price ?? 0);
-            $retail = (int)$item->price;
-            $wholesale = (int)($item->wholesale_price ?? $retail);
+            $qty = Quantity::normalize($item->stock_quantity);
+            $cost = $item->cost_price !== null ? (int) $item->cost_price : null;
+            $isMulti = $item->selling_method === Product::SELLING_METHOD_MULTIPLE;
+            $defaultUnit = $isMulti ? $item->defaultUnit() : null;
+
+            // Standard products value stock at their single price. Multi-UOM
+            // products derive a per-base-unit value from the default unit.
+            $retail = $isMulti
+                ? ($defaultUnit ? Quantity::toInt(Quantity::divide($defaultUnit->price, $defaultUnit->conversion_factor)) : 0)
+                : (int) ($item->price ?? 0);
+            $wholesale = $isMulti
+                ? ($defaultUnit ? Quantity::toInt(Quantity::divide($defaultUnit->wholesale_price, $defaultUnit->conversion_factor)) : 0)
+                : (int) ($item->wholesale_price ?? $item->price ?? 0);
+
+            $costValue = $cost !== null ? Quantity::toInt(Quantity::multiply($cost, $qty)) : 0;
+            $retailValue = Quantity::toInt(Quantity::multiply($retail, $qty));
+            $wholesaleValue = Quantity::toInt(Quantity::multiply($wholesale, $qty));
 
             if ($item->is_active) {
-                $inventoryTotalUnits += $qty;
-                $inventoryTotalCostValue += ($cost * $qty);
-                $inventoryTotalRetailValue += ($retail * $qty);
-                $inventoryTotalWholesaleValue += ($wholesale * $qty);
+                $inventoryTotalUnits = Quantity::add($inventoryTotalUnits, $qty);
+                $inventoryTotalCostValue += $costValue;
+                $inventoryTotalRetailValue += $retailValue;
+                $inventoryTotalWholesaleValue += $wholesaleValue;
 
-                if ($qty <= 0) {
+                if ($cost === null) {
+                    $missingCostItemsCount++;
+                }
+
+                if (Quantity::compare($qty, '0') <= 0) {
                     $outOfStockCount++;
                     $status = 'out_of_stock';
-                } elseif ($qty <= 10) {
+                } elseif (Quantity::compare($qty, '10') <= 0) {
                     $lowStockCount++;
                     $status = 'low_stock';
                 } else {
@@ -348,8 +391,8 @@ class ReportController extends Controller
                 $status = 'archived';
             }
 
-            $unrealizedProfit = ($retail - $cost) * $qty;
-            $marginPct = $retail > 0 ? round((($retail - $cost) / $retail) * 100, 1) : 0;
+            $unrealizedProfit = $retailValue - $costValue;
+            $marginPct = $retail > 0 ? round((($retail - ($cost ?? 0)) / $retail) * 100, 1) : 0;
 
             return [
                 'id' => $item->id,
@@ -357,12 +400,18 @@ class ReportController extends Controller
                 'sku' => $item->sku ?? 'N/A',
                 'category_name' => $item->category->name ?? 'Uncategorized',
                 'category_id' => $item->category_id,
-                'cost_price' => $cost,
+                'selling_method' => $item->selling_method,
+                'is_multi_unit' => $isMulti,
+                'base_unit' => $item->base_unit,
+                'quantity_precision' => $item->quantity_precision,
+                'default_unit_name' => $defaultUnit ? $defaultUnit->name : null,
+                'cost_price' => $cost ?? 0,
+                'has_cost_price' => $cost !== null,
                 'wholesale_price' => $wholesale,
                 'retail_price' => $retail,
-                'stock_quantity' => $qty,
-                'total_cost_value' => $cost * $qty,
-                'total_retail_value' => $retail * $qty,
+                'stock_quantity' => Quantity::toNumber($qty),
+                'total_cost_value' => $costValue,
+                'total_retail_value' => $retailValue,
                 'unrealized_profit' => $unrealizedProfit,
                 'margin_percent' => $marginPct,
                 'is_active' => (bool)$item->is_active,
@@ -370,35 +419,30 @@ class ReportController extends Controller
             ];
         });
 
-        // Category Valuation Breakdown for Visualizations
-        $categoryValuationsRaw = DB::table('products')
-            ->leftJoin('categories', 'products.category_id', '=', 'categories.id')
-            ->where('products.store_id', $storeId)
-            ->where('products.is_active', true)
-            ->selectRaw('
-                COALESCE(categories.id, 0) as category_id,
-                MAX(COALESCE(categories.name, \'Uncategorized\')) as category_name,
-                COUNT(*) as skus_count,
-                SUM(products.stock_quantity) as total_units,
-                SUM(COALESCE(products.cost_price, 0) * products.stock_quantity) as total_cost_value,
-                SUM(products.price * products.stock_quantity) as total_retail_value
-            ')
-            ->groupBy(DB::raw('COALESCE(categories.id, 0)'))
-            ->orderByDesc('total_retail_value')
-            ->get();
+        // Category Valuation Breakdown for Visualizations (base-unit values)
+        $categoryValuations = $inventoryItems
+            ->where('is_active', true)
+            ->groupBy('category_id')
+            ->map(function ($items) {
+                $first = $items->first();
+                $units = $items->reduce(
+                    fn ($carry, $row) => Quantity::add($carry, $row['stock_quantity']),
+                    '0'
+                );
+                $cost = (int) $items->sum('total_cost_value');
+                $retail = (int) $items->sum('total_retail_value');
 
-        $categoryValuations = $categoryValuationsRaw->map(function ($cv) {
-            $cost = (int)$cv->total_cost_value;
-            $retail = (int)$cv->total_retail_value;
-            return [
-                'name' => $cv->category_name,
-                'skus_count' => (int)$cv->skus_count,
-                'total_units' => (int)$cv->total_units,
-                'total_cost_value' => $cost,
-                'total_retail_value' => $retail,
-                'unrealized_profit' => $retail - $cost,
-            ];
-        });
+                return [
+                    'name' => $first['category_name'],
+                    'skus_count' => $items->count(),
+                    'total_units' => Quantity::toNumber($units),
+                    'total_cost_value' => $cost,
+                    'total_retail_value' => $retail,
+                    'unrealized_profit' => $retail - $cost,
+                ];
+            })
+            ->sortByDesc('total_retail_value')
+            ->values();
 
         // ---------------------------------------------------------------------
         // DOMAIN 4: SHIFTS & CASH RECONCILIATION AUDIT
@@ -478,10 +522,11 @@ class ReportController extends Controller
                 'void_count' => $voidCount,
                 'void_amount' => $voidAmountCents,
                 'inventory_skus' => $inventoryTotalSkus,
-                'inventory_units' => $inventoryTotalUnits,
+                'inventory_units' => Quantity::toNumber($inventoryTotalUnits),
                 'inventory_cost_value' => $inventoryTotalCostValue,
                 'inventory_retail_value' => $inventoryTotalRetailValue,
                 'inventory_unrealized_profit' => $inventoryTotalRetailValue - $inventoryTotalCostValue,
+                'inventory_missing_cost_count' => $missingCostItemsCount,
                 'healthy_stock_count' => $healthyStockCount,
                 'low_stock_count' => $lowStockCount,
                 'out_of_stock_count' => $outOfStockCount,
@@ -503,9 +548,10 @@ class ReportController extends Controller
                 'items' => $inventoryItems,
                 'categories_valuation' => $categoryValuations,
                 'total_skus' => $inventoryTotalSkus,
-                'total_units' => $inventoryTotalUnits,
+                'total_units' => Quantity::toNumber($inventoryTotalUnits),
                 'total_cost_value' => $inventoryTotalCostValue,
                 'total_retail_value' => $inventoryTotalRetailValue,
+                'missing_cost_count' => $missingCostItemsCount,
                 'healthy_count' => $healthyStockCount,
                 'low_stock_count' => $lowStockCount,
                 'out_of_stock_count' => $outOfStockCount,

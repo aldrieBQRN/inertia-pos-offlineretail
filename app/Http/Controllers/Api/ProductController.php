@@ -4,15 +4,18 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\Product;
+use App\Models\ProductUnit;
 use App\Models\SaleItem;
 use App\Models\ActivityLog;
 use App\Services\ImageCompressionService;
 use App\Services\ActivityService;
+use App\Support\Quantity;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\Rule;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 
 /**
  * ProductController
@@ -26,7 +29,9 @@ class ProductController extends Controller
      */
     public function index(Request $request)
     {
-        $query = Product::with('category');
+        // Units are required by the Inventory page (multiple-UOM "From" price / selling units),
+        // which re-polls this endpoint and replaces the page-load products with the result.
+        $query = Product::with(['category', 'units']);
 
         // Search constraint: filter by partial name or exact SKU matches
         if ($request->search) {
@@ -66,17 +71,20 @@ class ProductController extends Controller
      */
     public function store(Request $request)
     {
-        $request->validate([
+        $sellingMethod = $this->sellingMethodFrom($request);
+        $request->merge(['units' => $this->normalizedUnitsInput($request)]);
+
+        $rules = [
             'name' => 'required|string|max:255',
             'category_id' => 'required|exists:categories,id',
-            'price' => 'required|numeric|min:0',
+            'selling_method' => 'sometimes|in:standard,multiple',
+            'base_unit' => 'nullable|string|max:50',
+            'stock_quantity' => 'required|numeric|min:0',
+            'low_stock_threshold' => 'sometimes|integer|min:0',
             'cost_price' => 'required|numeric|min:0',
-            'wholesale_price' => 'required|numeric|min:0',
-            'stock_quantity' => 'required|integer|min:0',
             'sku' => [
                 'required',
                 'string',
-                // Scoped unique validation: Only check inside THIS store_id
                 Rule::unique('products', 'sku')->where(function ($query) {
                     $storeId = \App\Support\CurrentStore::id() ?? Auth::user()->store_id;
                     return $query->where('store_id', $storeId);
@@ -84,18 +92,46 @@ class ProductController extends Controller
             ],
             'image' => 'nullable|image|max:2048',
             'is_active' => 'sometimes|boolean',
-        ]);
+        ];
+
+        if ($sellingMethod === Product::SELLING_METHOD_MULTIPLE) {
+            $rules['base_unit'] = 'required|string|max:50';
+            $rules['quantity_decimals'] = 'nullable|integer|min:0|max:4';
+            $rules['stock_quantity'] = 'required|numeric|min:0';
+            $rules['units'] = 'required|array|min:1';
+            $rules['units.*.name'] = 'required|string|max:100';
+            $rules['units.*.conversion_factor'] = 'required|numeric|gt:0';
+            $rules['units.*.price'] = 'required|numeric|min:0';
+            $rules['units.*.wholesale_price'] = 'required|numeric|min:0';
+            $rules['units.*.is_default'] = 'sometimes|boolean';
+        } else {
+            $rules['price'] = 'required|numeric|min:0';
+            $rules['wholesale_price'] = 'required|numeric|min:0';
+            $rules['stock_quantity'] = 'required|integer|min:0';
+        }
+
+        $request->validate($rules);
 
         try {
-            $data = $request->all();
+            $data = $request->only([
+                'name', 'description', 'sku', 'selling_method', 'base_unit', 'category_id',
+                'low_stock_threshold', 'is_active',
+            ]);
 
-            // Convert decimal currency values to integers (cents)
-            $data['price'] = $request->price * 100;
-            if ($request->cost_price) {
-                $data['cost_price'] = $request->cost_price * 100;
-            }
-            if ($request->wholesale_price) {
-                $data['wholesale_price'] = $request->wholesale_price * 100;
+            $data['selling_method'] = $sellingMethod;
+            $data['stock_quantity'] = Quantity::normalize($request->stock_quantity);
+            $data['cost_price'] = Quantity::toInt(Quantity::multiply($request->cost_price, '100'));
+
+            if ($sellingMethod === Product::SELLING_METHOD_MULTIPLE) {
+                $data['base_unit'] = trim((string) $request->base_unit);
+                $data['quantity_decimals'] = $request->filled('quantity_decimals') ? (int) $request->quantity_decimals : null;
+                $data['price'] = null;
+                $data['wholesale_price'] = null;
+            } else {
+                $data['base_unit'] = null;
+                $data['quantity_decimals'] = null;
+                $data['price'] = Quantity::toInt(Quantity::multiply($request->price, '100'));
+                $data['wholesale_price'] = Quantity::toInt(Quantity::multiply($request->wholesale_price, '100'));
             }
 
             // Process and store the product image file
@@ -103,11 +139,9 @@ class ProductController extends Controller
                 try {
                     $imageCompression = new ImageCompressionService();
                     $path = $imageCompression->compressProductImage($request->file('image'));
-                    // FIXED: Added the /storage/ prefix to match the frontend and update method expectations
                     $data['image_path'] = '/storage/' . $path;
                 } catch (\Exception $e) {
                     Log::error('Image compression failed: ' . $e->getMessage());
-                    // Store original image as fallback
                     $data['image_path'] = '/storage/' . $request->file('image')->store('products', 'public');
                 }
             }
@@ -118,18 +152,107 @@ class ProductController extends Controller
                 $data['store_id'] = (int) $activeStoreId;
             }
 
+            DB::beginTransaction();
+            $product = Product::create($data);
+
+            // Sync units for Multiple UOM
+            if ($sellingMethod === Product::SELLING_METHOD_MULTIPLE && $request->has('units')) {
+                $this->syncUnits($product, $request->units);
+            }
+
+            DB::commit();
+
             // Reload so database defaults (e.g. is_active) are part of the logged record
-            $product = Product::create($data)->fresh();
+            $product = $product->fresh();
 
             // Log the product creation with every product field (critical audit trail)
             $imageNote = $product->image_path ? ' with product image' : '';
             ActivityService::logCreate('Product', $product->id, "Created product: {$product->name} (SKU: {$product->sku}){$imageNote}", $this->auditSnapshot($product));
 
-            return response()->json($product->fresh(), 201);
+            return response()->json($product->fresh(['units']), 201);
         } catch (\Exception $e) {
+            DB::rollBack();
             Log::error('Product creation failed: ' . $e->getMessage());
             return response()->json(['error' => 'Failed to create product: ' . $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Determine selling method from request.
+     */
+    private function sellingMethodFrom(Request $request): string
+    {
+        $method = $request->input('selling_method', 'standard');
+        return strtolower(trim($method)) === 'multiple' ? Product::SELLING_METHOD_MULTIPLE : Product::SELLING_METHOD_STANDARD;
+    }
+
+    /**
+     * Normalize units input from request.
+     */
+    private function normalizedUnitsInput(Request $request): array
+    {
+        $units = $request->input('units', []);
+        // The Inventory form posts multipart/form-data (for the image) with units as a JSON string
+        if (is_string($units)) {
+            $decoded = json_decode($units, true);
+            $units = is_array($decoded) ? $decoded : [];
+        }
+        if (!is_array($units)) {
+            return [];
+        }
+        return array_values(array_filter($units, fn($u) => is_array($u) && !empty($u['name'])));
+    }
+
+    /**
+     * Sync product units for Multiple UOM products.
+     */
+    private function syncUnits(Product $product, array $units): void
+    {
+        $product->units()->delete();
+        
+        $sortOrder = 1;
+        foreach ($units as $unit) {
+            $unitName = trim((string) $unit['name']);
+            if ($unitName === '') continue;
+            
+            $factor = $this->normalizeNumber($unit['conversion_factor'] ?? null);
+            $retailPrice = $this->normalizeNumber($unit['price'] ?? null);
+            $wholesalePrice = $this->normalizeNumber($unit['wholesale_price'] ?? null);
+            $isDefault = (isset($unit['is_default']) && $unit['is_default']) ? true : false;
+            $sort = isset($unit['sort_order']) ? (int) $unit['sort_order'] : $sortOrder;
+            
+            if ($factor && $retailPrice !== null && $wholesalePrice !== null) {
+                ProductUnit::create([
+                    'product_id' => $product->id,
+                    'name' => $unitName,
+                    'conversion_factor' => Quantity::normalize($factor),
+                    'price' => Quantity::toInt(Quantity::multiply($retailPrice, '100')),
+                    'wholesale_price' => Quantity::toInt(Quantity::multiply($wholesalePrice, '100')),
+                    'is_default' => $isDefault,
+                    'sort_order' => $sort,
+                ]);
+            }
+            $sortOrder++;
+        }
+    }
+
+    /**
+     * Normalize number from various formats.
+     */
+    private function normalizeNumber($v): ?float
+    {
+        if ($v === null || $v === '') return null;
+        if (is_numeric($v)) return (float) $v;
+        $s = trim((string) $v);
+        $s = preg_replace('/[^0-9,\.\-]/u', '', $s);
+        if ($s === '') return null;
+        if (strpos($s, ',') !== false && strpos($s, '.') !== false) {
+            $s = str_replace(',', '', $s);
+        } elseif (strpos($s, ',') !== false && strpos($s, '.') === false) {
+            $s = str_replace(',', '.', $s);
+        }
+        $s = str_replace(' ', '', $s);
+        return is_numeric($s) ? (float) $s : null;
     }
 
     /**
@@ -138,43 +261,79 @@ class ProductController extends Controller
     public function update(Request $request, $id)
     {
         $product = Product::findOrFail($id);
+        
+        $sellingMethod = $this->sellingMethodFrom($request);
+        $request->merge(['units' => $this->normalizedUnitsInput($request)]);
 
-        $request->validate([
+        $rules = [
             'name' => 'sometimes|string|max:255',
             'category_id' => 'sometimes|exists:categories,id',
-            'price' => 'sometimes|numeric|min:0',
+            'selling_method' => 'sometimes|in:standard,multiple',
+            'base_unit' => 'nullable|string|max:50',
+            'stock_quantity' => 'sometimes|numeric|min:0',
+            'low_stock_threshold' => 'sometimes|integer|min:0',
             'cost_price' => 'nullable|numeric|min:0',
-            'wholesale_price' => 'nullable|numeric|min:0',
-            'stock_quantity' => 'sometimes|integer|min:0',
-            'image' => 'nullable|image|max:2048',
             'sku' => [
                 'sometimes',
                 'string',
-                // FIXED: Scoped unique validation that ignores the CURRENT product's ID
                 Rule::unique('products', 'sku')->where(function ($query) {
                     $storeId = \App\Support\CurrentStore::id() ?? Auth::user()->store_id;
                     return $query->where('store_id', $storeId);
                 })->ignore($id)
             ],
+            'image' => 'nullable|image|max:2048',
             'is_active' => 'sometimes|boolean',
-        ]);
+        ];
+
+        if ($sellingMethod === Product::SELLING_METHOD_MULTIPLE) {
+            $rules['base_unit'] = 'required|string|max:50';
+            $rules['quantity_decimals'] = 'nullable|integer|min:0|max:4';
+            $rules['units'] = 'required|array|min:1';
+            $rules['units.*.name'] = 'required|string|max:100';
+            $rules['units.*.conversion_factor'] = 'required|numeric|gt:0';
+            $rules['units.*.price'] = 'required|numeric|min:0';
+            $rules['units.*.wholesale_price'] = 'required|numeric|min:0';
+            $rules['units.*.is_default'] = 'sometimes|boolean';
+        } else {
+            $rules['price'] = 'sometimes|numeric|min:0';
+            $rules['wholesale_price'] = 'nullable|numeric|min:0';
+            $rules['stock_quantity'] = 'sometimes|integer|min:0';
+        }
+
+        $request->validate($rules);
 
         try {
-            $data = $request->except(['image']);
+            $data = $request->only([
+                'name', 'description', 'sku', 'selling_method', 'base_unit', 'category_id',
+                'low_stock_threshold', 'is_active',
+            ]);
 
-            // Re-calculate currency values if updated
-            if ($request->has('price')) {
-                $data['price'] = $request->price * 100;
-            }
-            if ($request->has('cost_price')) {
-                $data['cost_price'] = $request->cost_price * 100;
-            }
-            if ($request->has('wholesale_price')) {
-                $data['wholesale_price'] = $request->wholesale_price !== null ? ($request->wholesale_price * 100) : null;
+            $data['selling_method'] = $sellingMethod;
+            $data['cost_price'] = $request->has('cost_price') ? Quantity::toInt(Quantity::multiply($request->cost_price, '100')) : $product->cost_price;
+
+            if ($sellingMethod === Product::SELLING_METHOD_MULTIPLE) {
+                $data['base_unit'] = trim((string) $request->base_unit);
+                $data['quantity_decimals'] = $request->filled('quantity_decimals') ? (int) $request->quantity_decimals : null;
+                $data['price'] = null;
+                $data['wholesale_price'] = null;
+                if ($request->has('stock_quantity')) {
+                    $data['stock_quantity'] = Quantity::normalize($request->stock_quantity);
+                }
+            } else {
+                $data['base_unit'] = null;
+                $data['quantity_decimals'] = null;
+                if ($request->has('price')) {
+                    $data['price'] = Quantity::toInt(Quantity::multiply($request->price, '100'));
+                }
+                if ($request->has('wholesale_price')) {
+                    $data['wholesale_price'] = $request->wholesale_price !== null ? Quantity::toInt(Quantity::multiply($request->wholesale_price, '100')) : null;
+                }
+                if ($request->has('stock_quantity')) {
+                    $data['stock_quantity'] = (int) $request->stock_quantity;
+                }
             }
 
-            // Handle image replacement (the previous image file is kept so the activity log
-            // can still show what the product looked like before the change)
+            // Handle image replacement
             if ($request->hasFile('image')) {
                 try {
                     $imageCompression = new ImageCompressionService();
@@ -182,7 +341,6 @@ class ProductController extends Controller
                     $data['image_path'] = '/storage/' . $path;
                 } catch (\Exception $e) {
                     Log::error('Image compression failed: ' . $e->getMessage());
-                    // Store original image as fallback
                     $data['image_path'] = '/storage/' . $request->file('image')->store('products', 'public');
                 }
             }
@@ -191,13 +349,21 @@ class ProductController extends Controller
             $hadImage = (bool) $oldValues['image_path'];
 
             $product->update($data);
+
+            // Sync units for Multiple UOM
+            if ($sellingMethod === Product::SELLING_METHOD_MULTIPLE && $request->has('units')) {
+                $this->syncUnits($product, $request->units);
+            } elseif ($sellingMethod !== Product::SELLING_METHOD_MULTIPLE) {
+                $product->units()->delete();
+            }
+
             $product->refresh();
 
             // Log the product update with the full before/after record (critical audit trail)
             $imageNote = $request->hasFile('image') ? ($hadImage ? ' (product image replaced)' : ' (product image added)') : '';
             ActivityService::logUpdate('Product', $product->id, "Updated product: {$product->name} (SKU: {$product->sku}){$imageNote}", $oldValues, $this->auditSnapshot($product));
 
-            return response()->json($product->fresh());
+            return response()->json($product->fresh(['units']));
         } catch (\Exception $e) {
             Log::error('Product update failed: ' . $e->getMessage());
             return response()->json(['error' => 'Failed to update product: ' . $e->getMessage()], 500);
@@ -247,131 +413,243 @@ class ProductController extends Controller
 
     /**
      * Rapidly adjust inventory levels for a specific item.
+     * Supports Multiple UOM: if unit_id is provided, quantity is converted to base units.
      */
     public function adjustStock(Request $request, $id)
     {
         $request->validate([
-            'quantity' => 'required|integer|min:1'
+            'quantity' => 'required|numeric|min:0.001',
+            'unit_id' => 'nullable|exists:product_units,id',
         ]);
 
         $product = Product::findOrFail($id);
-        $oldStock = (int) $product->stock_quantity;
-        $quantity = (int) $request->quantity;
-        $newStock = $oldStock + $quantity;
+        $isMultiple = $product->selling_method === Product::SELLING_METHOD_MULTIPLE;
+        $oldStock = Quantity::normalize($product->getRawOriginal('stock_quantity'));
+        $receivedText = Quantity::format($request->quantity);
+
+        // Convert the received quantity to base units (exact decimal, no rounding)
+        if ($request->filled('unit_id')) {
+            $unit = ProductUnit::findOrFail($request->unit_id);
+            if ($unit->product_id !== $product->id) {
+                return response()->json(['error' => 'Unit does not belong to this product'], 422);
+            }
+            $baseQuantity = Quantity::multiply($request->quantity, (string) $unit->conversion_factor);
+            $receivedText .= " {$unit->name}";
+        } else {
+            $baseQuantity = Quantity::normalize($request->quantity);
+        }
+
+        // Standard products keep whole-number stock
+        if (!$isMultiple) {
+            $baseQuantity = (string) Quantity::toInt($baseQuantity);
+        }
+
+        $newStock = Quantity::add($oldStock, $baseQuantity);
 
         // Atomic increment of the stock level
-        $product->increment('stock_quantity', $quantity);
+        $product->increment('stock_quantity', $baseQuantity);
 
-        $description = "Restocked {$quantity} unit(s) for: {$product->name} (Stock: {$oldStock} → {$newStock})";
+        $oldNumber = Quantity::toNumber($oldStock);
+        $newNumber = Quantity::toNumber($newStock);
+        if ($isMultiple) {
+            $baseUnit = $product->base_unit ?: 'unit(s)';
+            $received = $request->filled('unit_id')
+                ? "{$receivedText} (+" . Quantity::format($baseQuantity) . " {$baseUnit})"
+                : "{$receivedText} {$baseUnit}";
+            $description = "Received {$received} for: {$product->name} (Stock: {$oldNumber} → {$newNumber} {$baseUnit})";
+        } else {
+            $description = 'Restocked ' . Quantity::format($baseQuantity) . " unit(s) for: {$product->name} (Stock: {$oldNumber} → {$newNumber})";
+        }
 
         // Log the stock adjustment (critical audit trail with previous and new stock)
         ActivityService::logStockAdjust(
-            $id,
-            $quantity,
+            $product->id,
+            $baseQuantity,
             $description,
             $product->store_id,
-            $oldStock,
-            $newStock
+            $oldNumber,
+            $newNumber,
+            $isMultiple ? ($product->base_unit ?: null) : null
         );
 
         return response()->json([
             'message' => 'Stock updated successfully',
-            'new_stock' => $newStock
+            'new_stock' => $newNumber,
         ]);
     }
 
     /**
-     * Import a list of products from JSON.
+     * Bulk import products (Standard and Multiple UOM).
+     *
+     * The Inventory page parses the .xlsx/.csv file in the browser (store header
+     * rows, column header detection, example-row skipping) and posts the rows as
+     * JSON, the same contract used before Multiple UOM was introduced:
+     *   products[]: sku, name, category_name, price, wholesale_price, cost_price,
+     *               stock_quantity, selling_method?, base_unit?, default_unit?, rowNum?
+     *   units[]:    sku, unit_name, conversion_factor, retail_price,
+     *               wholesale_price, is_default, sort_order, rowNum?   (optional)
+     * Rows without a selling method are treated as Standard so old 7-column
+     * templates and exports keep importing.
+     *
+     * Existing products (matched by SKU): `overwrite` updates their details, otherwise
+     * they are skipped. Their stock is kept unless `update_stock` is true (e.g. after a
+     * physical count); then it is set from the file and logged as a stock adjustment.
+     * A blank stock cell never changes an existing product's stock.
      */
     public function bulkImport(Request $request)
     {
         $request->validate([
             'products' => 'required|array|min:1',
-            'products.*.name' => 'required|string|max:255',
-            'products.*.sku' => 'required|string',
-            'products.*.price' => 'required|numeric|min:0',
-            'products.*.cost_price' => 'nullable|numeric|min:0',
-            'products.*.wholesale_price' => 'nullable|numeric|min:0',
-            'products.*.stock_quantity' => 'required|integer|min:0',
-            'products.*.category_name' => 'nullable|string|max:255',
-            'overwrite' => 'nullable|boolean'
+            'units' => 'nullable|array',
+            'overwrite' => 'nullable|boolean',
+            'update_stock' => 'nullable|boolean',
+            'file_name' => 'nullable|string|max:255',
         ]);
 
-        \Illuminate\Support\Facades\DB::beginTransaction();
+        $productRows = $request->input('products', []);
+        $unitRows = $request->input('units', []) ?? [];
+        $overwrite = $request->boolean('overwrite');
+        $updateStock = $overwrite && $request->boolean('update_stock');
+        $fileName = $request->input('file_name') ?: 'import file';
+        $storeId = \App\Support\CurrentStore::id() ?? (Auth::user() ? Auth::user()->store_id : null);
+
+        $normalizeNumber = function ($v) {
+            if ($v === null || $v === '') return null;
+            if (is_numeric($v)) return $v;
+            $s = trim((string) $v);
+            $s = preg_replace('/[^0-9,\.\-]/u', '', $s);
+            if ($s === '') return null;
+            if (strpos($s, ',') !== false && strpos($s, '.') !== false) {
+                $s = str_replace(',', '', $s);
+            } elseif (strpos($s, ',') !== false && strpos($s, '.') === false) {
+                $s = str_replace(',', '.', $s);
+            }
+            return is_numeric($s) ? $s : null;
+        };
+        $isYes = function ($v) {
+            if (is_bool($v)) return $v;
+            return in_array(strtolower(trim((string) $v)), ['yes', 'y', 'true', '1'], true);
+        };
+        $toCents = fn ($v) => Quantity::toInt(Quantity::multiply($v, '100'));
+
+        // Group units by SKU and normalize to the shape syncUnits() expects
+        $unitsBySku = [];
+        foreach ($unitRows as $unit) {
+            $sku = trim((string) ($unit['sku'] ?? ''));
+            if ($sku === '') continue;
+            $unitsBySku[$sku][] = [
+                'rowNum' => $unit['rowNum'] ?? null,
+                'name' => trim((string) ($unit['unit_name'] ?? $unit['name'] ?? '')),
+                'conversion_factor' => $normalizeNumber($unit['conversion_factor'] ?? null),
+                'price' => $normalizeNumber($unit['retail_price'] ?? $unit['price'] ?? null),
+                'wholesale_price' => $normalizeNumber($unit['wholesale_price'] ?? null),
+                'is_default' => $isYes($unit['is_default'] ?? false),
+                'sort_order' => $normalizeNumber($unit['sort_order'] ?? null),
+            ];
+        }
+
+        DB::beginTransaction();
 
         try {
-            $storeId = \App\Support\CurrentStore::id() ?? (Auth::user() ? Auth::user()->store_id : null);
-            $overwrite = (bool) $request->input('overwrite', false);
             $importedCount = 0;
             $updatedCount = 0;
             $skippedCount = 0;
             $skippedSkus = [];
+            $stockUpdatedCount = 0;
             $errors = [];
+            $warnings = [];
+            $importedSkus = [];
 
-            foreach ($request->products as $item) {
-                $displayRow = $item['rowNum'] ?? ($importedCount + $updatedCount + 2);
-                
-                // Track missing/invalid fields for this specific row
+            foreach ($productRows as $index => $item) {
+                $displayRow = $item['rowNum'] ?? ($index + 2);
                 $rowErrors = [];
 
-                // Normalize numeric-looking fields to ensure server-side validation accepts
-                $normalizeNumber = function ($v) {
-                    if ($v === null || $v === '') return 0;
-                    if (is_numeric($v)) return $v;
-                    $s = (string) $v;
-                    $s = trim($s);
-                    // Remove common currency symbols and spaces
-                    $s = preg_replace('/[^0-9,\.\-]/u', '', $s);
-                    if ($s === '') return 0;
-                    // If both comma and dot present, assume comma is thousands separator
-                    if (strpos($s, ',') !== false && strpos($s, '.') !== false) {
-                        $s = str_replace(',', '', $s);
-                    } elseif (strpos($s, ',') !== false && strpos($s, '.') === false) {
-                        // comma as decimal separator
-                        $s = str_replace(',', '.', $s);
+                $sku = trim((string) ($item['sku'] ?? ''));
+                $name = trim((string) ($item['name'] ?? ''));
+                $categoryName = trim((string) ($item['category_name'] ?? ''));
+                $rawMethod = strtolower(trim((string) ($item['selling_method'] ?? '')));
+                $baseUnit = trim((string) ($item['base_unit'] ?? ''));
+                $defaultUnit = trim((string) ($item['default_unit'] ?? ''));
+
+                $price = $normalizeNumber($item['price'] ?? null);
+                $wholesalePrice = $normalizeNumber($item['wholesale_price'] ?? null);
+                $costPrice = $normalizeNumber($item['cost_price'] ?? null);
+                $stockQuantity = $normalizeNumber($item['stock_quantity'] ?? null);
+                $stockProvided = $stockQuantity !== null;
+
+                if ($sku === '') $rowErrors[] = 'SKU is empty';
+                if ($name === '') $rowErrors[] = 'Product Name is empty';
+                if ($categoryName === '') $rowErrors[] = 'Category Name is empty';
+
+                // Blank selling method = Standard (old 7-column templates/exports have no such column)
+                if ($rawMethod === '') $rawMethod = 'standard';
+                if (!in_array($rawMethod, ['standard', 'multiple uom', 'multiple'], true)) {
+                    $rowErrors[] = "Selling Method must be 'Standard' or 'Multiple UOM'";
+                }
+                $isMultiple = in_array($rawMethod, ['multiple uom', 'multiple'], true);
+                $sellingMethod = $isMultiple ? 'multiple' : 'standard';
+
+                if ($isMultiple) {
+                    if ($baseUnit === '') $rowErrors[] = 'Base Unit is required for Multiple UOM products';
+                    if ($defaultUnit === '') $rowErrors[] = 'Default Unit is required for Multiple UOM products';
+                    if ($costPrice === null || $costPrice < 0) $rowErrors[] = 'Cost Price (per base unit) is required for Multiple UOM products';
+                    if ($stockQuantity === null || $stockQuantity < 0) $rowErrors[] = 'Stock Quantity (in base units) is required for Multiple UOM products';
+
+                    $productUnits = $unitsBySku[$sku] ?? [];
+                    if (empty($productUnits)) {
+                        $rowErrors[] = "Multiple UOM product '{$sku}' must have at least one unit in Product Units sheet";
+                    } else {
+                        $defaultCount = 0;
+                        $unitNames = [];
+                        foreach ($productUnits as $unit) {
+                            $unitName = $unit['name'];
+                            if ($unitName === '') {
+                                $rowErrors[] = "Unit name is empty for product '{$sku}'";
+                            } elseif (in_array(strtolower($unitName), $unitNames, true)) {
+                                $rowErrors[] = "Duplicate unit name '{$unitName}' for product '{$sku}'";
+                            }
+                            $unitNames[] = strtolower($unitName);
+
+                            if ($unit['conversion_factor'] === null || $unit['conversion_factor'] <= 0) {
+                                $rowErrors[] = "Conversion factor must be > 0 for unit '{$unitName}' of product '{$sku}'";
+                            }
+                            if ($unit['price'] === null || $unit['price'] < 0) {
+                                $rowErrors[] = "Retail price required for unit '{$unitName}' of product '{$sku}'";
+                            }
+                            if ($unit['wholesale_price'] === null || $unit['wholesale_price'] < 0) {
+                                $rowErrors[] = "Wholesale price required for unit '{$unitName}' of product '{$sku}'";
+                            }
+                            if ($unit['is_default']) $defaultCount++;
+                        }
+                        if ($defaultCount !== 1) {
+                            $rowErrors[] = "Product '{$sku}' must have exactly one default unit (Is Default = Yes)";
+                        }
                     }
-                    $s = str_replace(' ', '', $s);
-                    return is_numeric($s) ? $s : 0;
-                };
+                } else {
+                    // Standard: blank wholesale/cost/stock default to 0, as before
+                    $wholesalePrice = $wholesalePrice ?? 0;
+                    $costPrice = $costPrice ?? 0;
+                    $stockQuantity = $stockQuantity ?? 0;
 
-                // Coerce incoming price fields to numeric (handles '0', '0.00', '0,00', '1,234.56')
-                $item['price'] = $normalizeNumber($item['price'] ?? null);
-                $item['wholesale_price'] = $normalizeNumber($item['wholesale_price'] ?? null);
-                $item['cost_price'] = $normalizeNumber($item['cost_price'] ?? null);
-
-                if (empty($item['sku'])) {
-                    $rowErrors[] = "Barcode/SKU is empty";
-                }
-                if (empty($item['name'])) {
-                    $rowErrors[] = "Product Name is empty";
-                }
-                if (empty($item['category_name'])) {
-                    $rowErrors[] = "Category Name is empty";
-                }
-                if (!isset($item['price']) || $item['price'] === '' || !is_numeric($item['price'])) {
-                    $rowErrors[] = "Retail Price must be a valid number";
-                }
-                if (!isset($item['wholesale_price']) || $item['wholesale_price'] === '' || !is_numeric($item['wholesale_price'])) {
-                    $rowErrors[] = "Wholesale Price must be a valid number";
-                }
-                if (!isset($item['cost_price']) || $item['cost_price'] === '' || !is_numeric($item['cost_price'])) {
-                    $rowErrors[] = "Cost Price must be a valid number";
-                }
-                if (!isset($item['stock_quantity']) || $item['stock_quantity'] === '' || !is_numeric($item['stock_quantity'])) {
-                    $rowErrors[] = "Stock Quantity must be a valid number";
+                    if ($price === null || $price < 0) $rowErrors[] = 'Retail Price is required for Standard products';
+                    if ($wholesalePrice < 0) $rowErrors[] = 'Wholesale Price cannot be negative';
+                    if ($costPrice < 0) $rowErrors[] = 'Cost Price cannot be negative';
+                    if ($stockQuantity < 0) $rowErrors[] = 'Stock Quantity cannot be negative';
+                    if (!empty($unitsBySku[$sku])) {
+                        $warnings[] = "Row {$displayRow}: Units found for Standard product '{$sku}' - they will be ignored";
+                    }
                 }
 
                 if (!empty($rowErrors)) {
-                    $errors[] = "Row {$displayRow}: " . implode(', ', $rowErrors);
+                    foreach ($rowErrors as $err) {
+                        $errors[] = "Row {$displayRow} (SKU: {$sku}): {$err}";
+                    }
                     continue;
                 }
 
-                $sku = trim($item['sku']);
+                $importedSkus[$sku] = true;
 
-                // Find or create category
-                $categoryId = null;
-                $categoryName = trim($item['category_name']);
-                $category = \App\Models\Category::where('name', $categoryName)->first();
+                $category = \App\Models\Category::where('name', $categoryName)->where('store_id', $storeId)->first();
                 if (!$category) {
                     $category = \App\Models\Category::create([
                         'name' => $categoryName,
@@ -379,78 +657,208 @@ class ProductController extends Controller
                         'store_id' => $storeId,
                     ]);
                 }
-                $categoryId = $category->id;
 
-                // Find existing product by SKU under this store
                 $existingProduct = Product::where('sku', $sku)->where('store_id', $storeId)->first();
 
                 if ($existingProduct) {
-                    if ($overwrite) {
-                        $existingProduct->update([
-                            'name' => trim($item['name']),
-                            'category_id' => $categoryId,
-                            'price' => (int) round($item['price'] * 100),
-                            'cost_price' => (int) round($item['cost_price'] * 100),
-                            'wholesale_price' => (int) round($item['wholesale_price'] * 100),
-                            'stock_quantity' => (int) $item['stock_quantity'],
-                            'is_active' => true,
-                        ]);
-                        $updatedCount++;
-                    } else {
+                    if (!$overwrite) {
                         $skippedCount++;
-                        $skippedSkus[] = $sku . ' - ' . trim($item['name']);
+                        $skippedSkus[] = $sku . ' - ' . $name;
+                        continue;
                     }
+
+                    // Stock is only changed when update_stock is requested (see below)
+                    $oldStock = Quantity::normalize($existingProduct->getRawOriginal('stock_quantity'));
+                    $beforeSnapshot = $this->auditSnapshot($existingProduct);
+
+                    $existingProduct->update([
+                        'name' => $name,
+                        'category_id' => $category->id,
+                        'selling_method' => $sellingMethod,
+                        'base_unit' => $isMultiple ? $baseUnit : null,
+                        'price' => $isMultiple ? null : $toCents($price),
+                        'wholesale_price' => $isMultiple ? null : $toCents($wholesalePrice),
+                        'cost_price' => $toCents($costPrice),
+                        'is_active' => true,
+                    ]);
+
+                    if ($isMultiple) {
+                        $this->syncUnits($existingProduct, $unitsBySku[$sku]);
+                    } else {
+                        $existingProduct->units()->delete();
+                    }
+
+                    if ($updateStock && $stockProvided) {
+                        $newStock = Quantity::normalize($stockQuantity);
+                        if (Quantity::compare($newStock, $oldStock) !== 0) {
+                            $existingProduct->update(['stock_quantity' => $newStock]);
+
+                            $oldNumber = Quantity::toNumber($oldStock);
+                            $newNumber = Quantity::toNumber($newStock);
+                            $unitLabel = $isMultiple ? " {$baseUnit}" : '';
+                            ActivityService::logStockAdjust(
+                                $existingProduct->id,
+                                Quantity::subtract($newStock, $oldStock),
+                                "Stock set from import for: {$name} (Stock: {$oldNumber}{$unitLabel} → {$newNumber}{$unitLabel})",
+                                $storeId,
+                                $oldNumber,
+                                $newNumber,
+                                $isMultiple ? $baseUnit : null
+                            );
+                            $stockUpdatedCount++;
+                        }
+                    }
+
+                    // Audit detail changes (stock changes are logged above as stock adjustments)
+                    $afterSnapshot = $this->auditSnapshot($existingProduct->refresh());
+                    unset($beforeSnapshot['stock_quantity'], $afterSnapshot['stock_quantity']);
+                    if ($beforeSnapshot != $afterSnapshot) {
+                        ActivityService::logUpdate(
+                            'Product',
+                            $existingProduct->id,
+                            "Updated product via import ({$fileName}): {$name} (SKU: {$sku})",
+                            $beforeSnapshot,
+                            $afterSnapshot
+                        );
+                    }
+
+                    $updatedCount++;
                     continue;
                 }
 
-                $productData = [
-                    'name' => trim($item['name']),
-                    'category_id' => $categoryId,
-                    'price' => (int) round($item['price'] * 100),
-                    'cost_price' => (int) round($item['cost_price'] * 100),
-                    'wholesale_price' => (int) round($item['wholesale_price'] * 100),
-                    'stock_quantity' => (int) $item['stock_quantity'],
+                $product = Product::create([
+                    'name' => $name,
+                    'category_id' => $category->id,
                     'sku' => $sku,
+                    'selling_method' => $sellingMethod,
+                    'base_unit' => $isMultiple ? $baseUnit : null,
+                    'price' => $isMultiple ? null : $toCents($price),
+                    'wholesale_price' => $isMultiple ? null : $toCents($wholesalePrice),
+                    'cost_price' => $toCents($costPrice),
+                    'stock_quantity' => Quantity::normalize($stockQuantity),
                     'is_active' => true,
-                    'store_id' => $storeId, // Ensure store_id is set
-                ];
+                    'store_id' => $storeId,
+                ]);
 
-                Product::create($productData);
+                if ($isMultiple) {
+                    $this->syncUnits($product, $unitsBySku[$sku]);
+                }
+
+                ActivityService::logCreate(
+                    'Product',
+                    $product->id,
+                    "Imported product from {$fileName}: {$name} (SKU: {$sku})",
+                    $this->auditSnapshot($product->refresh())
+                );
+
                 $importedCount++;
             }
 
+            // Units referencing SKUs that are neither in the import nor in the database
+            foreach (array_keys($unitsBySku) as $sku) {
+                $sku = (string) $sku;
+                $inImport = collect($productRows)->contains(fn ($row) => trim((string) ($row['sku'] ?? '')) === $sku);
+                if (!$inImport && !Product::where('sku', $sku)->where('store_id', $storeId)->exists()) {
+                    $errors[] = "Product Units sheet references unknown SKU '{$sku}' (not in Products sheet or database)";
+                }
+            }
+
             if (!empty($errors)) {
-                \Illuminate\Support\Facades\DB::rollBack();
+                DB::rollBack();
+                ActivityService::log('inventory.import', 'import_failed', 'Inventory', null,
+                    "Import of {$fileName} was rejected (" . count($errors) . ' error(s)); nothing was saved',
+                    null,
+                    ['file_name' => $fileName, 'rows' => count($productRows), 'errors' => array_slice($errors, 0, 20)]
+                );
                 return response()->json([
                     'success' => false,
-                    'message' => 'Import validation failed. Please correct the Excel file and try again.',
-                    'errors' => $errors
+                    'message' => 'Import validation failed. Please correct the file and try again.',
+                    'errors' => $errors,
+                    'warnings' => $warnings,
                 ], 422);
             }
 
-            \Illuminate\Support\Facades\DB::commit();
+            ActivityService::log('inventory.import', 'import', 'Inventory', null,
+                "Imported {$fileName}: {$importedCount} new, {$updatedCount} updated"
+                    . ($stockUpdatedCount ? " ({$stockUpdatedCount} stock change(s))" : '')
+                    . ($skippedCount ? ", {$skippedCount} skipped" : ''),
+                null,
+                [
+                    'file_name' => $fileName,
+                    'rows' => count($productRows),
+                    'units_rows' => count($unitRows),
+                    'new_products' => $importedCount,
+                    'updated_products' => $updatedCount,
+                    'skipped_products' => $skippedCount,
+                    'stock_changes' => $stockUpdatedCount,
+                    'existing_products' => $overwrite ? 'Update details' : 'Skip',
+                    'update_stock' => $updateStock,
+                ]
+            );
+
+            DB::commit();
 
             return response()->json([
                 'success' => true,
-                'message' => "Successfully processed import.",
+                'message' => 'Successfully processed import.',
                 'imported_count' => $importedCount,
                 'updated_count' => $updatedCount,
+                'stock_updated_count' => $stockUpdatedCount,
                 'skipped_count' => $skippedCount,
                 'skipped_skus' => $skippedSkus,
+                'warnings' => $warnings,
             ]);
-        } catch (\Exception $e) {
-            \Illuminate\Support\Facades\DB::rollBack();
-            Log::error('Bulk import failed: ' . $e->getMessage());
+        } catch (\Throwable $e) {
+            DB::rollBack();
+            Log::error('Bulk import failed: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
             return response()->json([
                 'success' => false,
-                'message' => 'Failed to import products: ' . $e->getMessage()
+                'message' => 'Failed to import products: ' . $e->getMessage(),
             ], 500);
         }
     }
 
     /**
-     * Get the next sequential auto-incrementing SKU prefixed with 'ITEM-'.
+     * Audit an inventory export done in the browser (Excel / PDF / ledger / activity feed).
+     * Exports carry store data out of the system, so who exported what and when is logged.
      */
+    public function logExport(Request $request)
+    {
+        $data = $request->validate([
+            'type' => 'required|in:inventory_excel,inventory_pdf,stock_ledger_excel,activity_excel',
+            'count' => 'nullable|integer|min:0',
+            'units_count' => 'nullable|integer|min:0',
+            'filters' => 'nullable|string|max:500',
+            'product_id' => 'nullable|integer',
+            'file_name' => 'nullable|string|max:255',
+        ]);
+
+        $count = (int) ($data['count'] ?? 0);
+        $product = !empty($data['product_id']) ? Product::find($data['product_id']) : null;
+
+        $description = match ($data['type']) {
+            'inventory_excel' => "Exported inventory to Excel ({$count} product(s)"
+                . (!empty($data['units_count']) ? ", {$data['units_count']} selling unit(s)" : '') . ')',
+            'inventory_pdf' => "Exported inventory report to PDF ({$count} product(s))"
+                . (!empty($data['filters']) ? " - {$data['filters']}" : ''),
+            'stock_ledger_excel' => 'Exported stock ledger to Excel for '
+                . ($product ? "{$product->name} (SKU: {$product->sku})" : 'a product') . " ({$count} movement(s))",
+            'activity_excel' => "Exported inventory activity feed to Excel ({$count} entr" . ($count === 1 ? 'y' : 'ies') . ')',
+        };
+
+        // Logged on Inventory without a model id so it never shows inside a product's stock ledger
+        ActivityService::log('inventory.export', 'export', 'Inventory', null, $description, null, array_filter([
+            'export_type' => $data['type'],
+            'file_name' => $data['file_name'] ?? null,
+            'records' => $count,
+            'selling_units' => $data['units_count'] ?? null,
+            'filters' => $data['filters'] ?? null,
+            'product' => $product ? "{$product->name} (SKU: {$product->sku})" : null,
+        ], fn ($v) => $v !== null && $v !== ''));
+
+        return response()->json(['success' => true]);
+    }
+
     public function getNextSku()
     {
         $storeId = \App\Support\CurrentStore::id() ?? (Auth::user() ? Auth::user()->store_id : null);
@@ -517,139 +925,9 @@ class ProductController extends Controller
     public function stockHistory($id)
     {
         try {
-            $product = Product::with('category')->findOrFail($id);
-            $storeId = $product->store_id ?? \App\Support\CurrentStore::id() ?? (Auth::user() ? Auth::user()->store_id : null);
+            $product = Product::with(['category', 'units'])->findOrFail($id);
 
-            // 1. Fetch sales deductions from SaleItem
-            $salesQuery = SaleItem::where('product_id', $id)->with(['sale.cashier'])->orderBy('created_at', 'desc')->limit(50);
-            if ($storeId) {
-                $salesQuery->whereHas('sale', function ($q) use ($storeId) {
-                    $q->where('store_id', $storeId);
-                });
-            }
-
-            $sales = $salesQuery->get()->map(function ($item) {
-                $inv = $item->sale && $item->sale->invoice_number 
-                    ? $item->sale->invoice_number 
-                    : ('POS-' . str_pad($item->sale_id ?? $item->id, 5, '0', STR_PAD_LEFT));
-
-                return [
-                    'id' => 'sale-' . $item->id,
-                    'type' => 'sale',
-                    'quantity_change' => -$item->quantity,
-                    'quantity' => $item->quantity,
-                    'unit_price' => $item->unit_price / 100,
-                    'subtotal' => $item->subtotal / 100,
-                    'invoice_number' => $inv,
-                    'reference_no' => $inv,
-                    'user_name' => $item->sale && $item->sale->cashier ? $item->sale->cashier->name : 'POS Cashier',
-                    'user_avatar' => $item->sale && $item->sale->cashier && $item->sale->cashier->avatar_path ? (str_starts_with($item->sale->cashier->avatar_path, 'http') ? $item->sale->cashier->avatar_path : asset('storage/' . $item->sale->cashier->avatar_path)) : null,
-                    'user_account_number' => $item->sale && $item->sale->cashier ? $item->sale->cashier->account_number : null,
-                    'description' => "Sold {$item->quantity} unit(s) via POS (₱" . number_format($item->subtotal / 100, 2) . ")",
-                    'created_at' => $item->created_at ? $item->created_at->toIso8601String() : now()->toIso8601String(),
-                ];
-            });
-
-            // 2. Fetch stock adjustments & restock logs from ActivityLog
-            $logsQuery = ActivityLog::where(function ($q) use ($id) {
-                $q->where(function ($q2) use ($id) {
-                    $q2->where('model_type', 'Product')->where('model_id', $id);
-                })->orWhere(function ($q2) use ($id) {
-                    $q2->where('model_type', 'Inventory')->where('model_id', $id);
-                });
-            });
-
-            if ($storeId) {
-                $logsQuery->where('store_id', $storeId);
-            }
-
-            $logs = $logsQuery->with('user')
-                ->orderBy('created_at', 'desc')
-                ->limit(50)
-                ->get()
-                ->map(function ($log) {
-                    $type = 'adjustment';
-                    $quantityChange = 0;
-
-                    if ($log->action === 'stock.adjusted' || str_contains(strtolower($log->action), 'stock')) {
-                        $type = 'restock';
-                        $quantityChange = (int) ($log->new_values['quantity_change'] ?? $log->new_values['quantity_added'] ?? $log->new_values['quantity'] ?? 0);
-                        if ($quantityChange === 0 && isset($log->new_values['stock_quantity'], $log->old_values['stock_quantity'])) {
-                            $quantityChange = (int)$log->new_values['stock_quantity'] - (int)$log->old_values['stock_quantity'];
-                        }
-                    } elseif ($log->action === 'created' || str_contains(strtolower($log->action), 'create')) {
-                        $type = 'creation';
-                        $quantityChange = (int) ($log->new_values['stock'] ?? $log->new_values['stock_quantity'] ?? 0);
-                    }
-
-                    $refNo = 'LOG-' . str_pad($log->id, 5, '0', STR_PAD_LEFT);
-
-                    return [
-                        'id' => 'log-' . $log->id,
-                        'type' => $type,
-                        'action' => $log->action,
-                        'quantity_change' => $quantityChange,
-                        'reference_no' => $refNo,
-                        'invoice_number' => $refNo,
-                        'old_values' => $log->old_values,
-                        'new_values' => $log->new_values,
-                        'user_name' => $log->user ? $log->user->name : 'Store Admin',
-                        'user_avatar' => $log->user && $log->user->avatar_path ? (str_starts_with($log->user->avatar_path, 'http') ? $log->user->avatar_path : asset('storage/' . $log->user->avatar_path)) : null,
-                        'user_account_number' => $log->user ? $log->user->account_number : null,
-                        'description' => $log->description ?: "Stock updated for product",
-                        'created_at' => $log->created_at ? $log->created_at->toIso8601String() : now()->toIso8601String(),
-                    ];
-                });
-
-            // Combine list
-            $timeline = $sales->concat($logs)->all();
-
-            // 3. Always include initial catalog registration record
-            $hasCreationLog = collect($timeline)->contains(fn($t) => $t['type'] === 'creation');
-            if (!$hasCreationLog && $product->created_at) {
-                $skuRef = $product->sku ? $product->sku : ('PRD-' . str_pad($product->id, 5, '0', STR_PAD_LEFT));
-                $timeline[] = [
-                    'id' => 'initial-reg-' . $product->id,
-                    'type' => 'creation',
-                    'action' => 'created',
-                    'quantity_change' => $product->stock_quantity,
-                    'reference_no' => $skuRef,
-                    'invoice_number' => $skuRef,
-                    'user_name' => 'Store Admin',
-                    'user_avatar' => null,
-                    'user_account_number' => null,
-                    'description' => "Initial catalog registration for {$product->name} (SKU: {$product->sku})",
-                    'created_at' => $product->created_at->toIso8601String(),
-                ];
-            }
-
-            // Sort chronologically descending
-            usort($timeline, fn($a, $b) => strcmp($b['created_at'], $a['created_at']));
-
-            // Calculate aggregate statistics for this item
-            $totalSoldUnits = (int) SaleItem::where('product_id', $id)->sum('quantity');
-            $totalSalesRevenue = (float) (SaleItem::where('product_id', $id)->sum('subtotal') / 100);
-
-            return response()->json([
-                'success' => true,
-                'product' => [
-                    'id' => $product->id,
-                    'name' => $product->name,
-                    'sku' => $product->sku,
-                    'price' => $product->price / 100,
-                    'cost_price' => $product->cost_price ? $product->cost_price / 100 : null,
-                    'stock_quantity' => $product->stock_quantity,
-                    'is_active' => $product->is_active,
-                    'category_name' => $product->category ? $product->category->name : 'Uncategorized',
-                    'created_at' => $product->created_at ? $product->created_at->toIso8601String() : null,
-                ],
-                'stats' => [
-                    'total_sold_units' => $totalSoldUnits,
-                    'total_revenue' => $totalSalesRevenue,
-                    'current_stock' => $product->stock_quantity,
-                ],
-                'timeline' => $timeline
-            ]);
+            return response()->json(['success' => true] + \App\Services\InventoryLedgerService::historyFor($product));
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::error('Stock history error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
             return response()->json(['error' => 'Failed to fetch stock history: ' . $e->getMessage()], 500);
@@ -664,101 +942,9 @@ class ProductController extends Controller
         try {
             $storeId = \App\Support\CurrentStore::id() ?? (Auth::user() ? Auth::user()->store_id : null);
 
-            // 1. Fetch activity logs
-            $logsQuery = ActivityLog::where(function ($q) {
-                $q->whereIn('model_type', ['Product', 'Inventory', 'Category'])
-                  ->orWhere('action', 'like', '%stock%')
-                  ->orWhere('action', 'like', '%product%')
-                  ->orWhere('action', 'like', '%category%');
-            });
-
-            if ($storeId) {
-                $logsQuery->where('store_id', $storeId);
-            }
-
-            $logs = $logsQuery->with(['user'])
-                ->orderBy('created_at', 'desc')
-                ->limit(50)
-                ->get()
-                ->map(function ($log) {
-                    return [
-                        'id' => 'log-' . $log->id,
-                        'action' => $log->action,
-                        'model_type' => $log->model_type,
-                        'model_id' => $log->model_id,
-                        'reference_no' => 'LOG-' . str_pad($log->id, 5, '0', STR_PAD_LEFT),
-                        'description' => $log->description,
-                        'user_name' => $log->user ? $log->user->name : 'System',
-                        'user_avatar' => $log->user && $log->user->avatar_path ? (str_starts_with($log->user->avatar_path, 'http') ? $log->user->avatar_path : asset('storage/' . $log->user->avatar_path)) : null,
-                        'user_account_number' => $log->user ? $log->user->account_number : null,
-                        'old_values' => $log->old_values,
-                        'new_values' => $log->new_values,
-                        'created_at' => $log->created_at ? $log->created_at->toIso8601String() : now()->toIso8601String(),
-                    ];
-                });
-
-            // 2. Fetch recent sales deductions from SaleItem
-            $salesQuery = SaleItem::with(['sale.cashier', 'product'])->orderBy('created_at', 'desc')->limit(30);
-            if ($storeId) {
-                $salesQuery->whereHas('sale', function ($q) use ($storeId) {
-                    $q->where('store_id', $storeId);
-                });
-            }
-
-            $sales = $salesQuery->get()->map(function ($item) {
-                $prodName = $item->product ? $item->product->name : ($item->custom_name ?: 'Product Item');
-                $invoice = $item->sale ? $item->sale->invoice_number : '';
-                return [
-                    'id' => 'sale-' . $item->id,
-                    'action' => 'stock.sale',
-                    'model_type' => 'Product',
-                    'model_id' => $item->product_id,
-                    'invoice_number' => $invoice,
-                    'reference_no' => $invoice ?: ('SALE-' . str_pad($item->sale_id ?: $item->id, 5, '0', STR_PAD_LEFT)),
-                    'sku' => $item->product ? $item->product->sku : null,
-                    'description' => "Sold {$item->quantity}x {$prodName} via POS" . ($invoice ? " (Inv: {$invoice})" : ""),
-                    'user_name' => $item->sale && $item->sale->cashier ? $item->sale->cashier->name : 'Cashier',
-                    'user_avatar' => $item->sale && $item->sale->cashier && $item->sale->cashier->avatar_path ? (str_starts_with($item->sale->cashier->avatar_path, 'http') ? $item->sale->cashier->avatar_path : asset('storage/' . $item->sale->cashier->avatar_path)) : null,
-                    'user_account_number' => $item->sale && $item->sale->cashier ? $item->sale->cashier->account_number : null,
-                    'created_at' => $item->created_at ? $item->created_at->toIso8601String() : now()->toIso8601String(),
-                ];
-            });
-
-            // 3. Fetch recent product additions
-            $prodQuery = Product::orderBy('created_at', 'desc')->limit(15);
-            if ($storeId) {
-                $prodQuery->where('store_id', $storeId);
-            }
-
-            // Products created through the app already have a "Created product" log; only list the rest once
-            $recentProducts = $prodQuery->get();
-            $loggedProductIds = ActivityLog::where('model_type', 'Product')
-                ->where('action', 'create')
-                ->whereIn('model_id', $recentProducts->pluck('id'))
-                ->pluck('model_id')
-                ->all();
-            $recentProducts = $recentProducts->reject(fn ($p) => in_array($p->id, $loggedProductIds))->map(function ($p) {
-                return [
-                    'id' => 'prod-reg-' . $p->id,
-                    'action' => 'created',
-                    'model_type' => 'Product',
-                    'model_id' => $p->id,
-                    'sku' => $p->sku,
-                    'reference_no' => $p->sku ? ('SKU: ' . $p->sku) : ('PRD-' . str_pad($p->id, 5, '0', STR_PAD_LEFT)),
-                    'description' => "Registered new product: {$p->name} (SKU: {$p->sku}) with {$p->stock_quantity} units",
-                    'user_name' => 'Store Admin',
-                    'user_avatar' => null,
-                    'user_account_number' => null,
-                    'created_at' => $p->created_at ? $p->created_at->toIso8601String() : now()->toIso8601String(),
-                ];
-            });
-
-            // Combine and sort chronologically
-            $combined = $logs->concat($sales)->concat($recentProducts)->sortByDesc('created_at')->values()->take(50)->all();
-
             return response()->json([
                 'success' => true,
-                'data' => $combined
+                'data' => \App\Services\InventoryLedgerService::recentActivity($storeId),
             ]);
         } catch (\Throwable $e) {
             \Illuminate\Support\Facades\Log::error('Recent activity error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
@@ -774,20 +960,44 @@ class ProductController extends Controller
         $category = $product->category_id
             ? \App\Models\Category::withoutGlobalScopes()->whereKey($product->category_id)->value('name')
             : null;
+        $isMultiple = $product->selling_method === Product::SELLING_METHOD_MULTIPLE;
 
-        return [
+        $snapshot = [
             'name' => $product->name,
             'sku' => $product->sku,
             'description' => $product->description,
             'category' => $category,
+            'selling_method' => $isMultiple ? 'Multiple UOM' : 'Standard',
+            'base_unit' => $isMultiple ? $product->base_unit : null,
+            'quantity_decimals' => $isMultiple ? $product->quantity_precision : null,
             'price' => $product->price !== null ? $product->price / 100 : null,
             'cost_price' => $product->cost_price !== null ? $product->cost_price / 100 : null,
             'wholesale_price' => $product->wholesale_price !== null ? $product->wholesale_price / 100 : null,
-            'stock_quantity' => (int) $product->stock_quantity,
+            'stock_quantity' => Quantity::toNumber($product->getRawOriginal('stock_quantity') ?? $product->stock_quantity),
             'low_stock_threshold' => $product->low_stock_threshold,
             'is_active' => (bool) $product->is_active,
             'image_path' => $product->image_path,
             'store_id' => $product->store_id,
         ];
+
+        if ($isMultiple) {
+            // Read fresh from the database so before/after snapshots reflect the saved units
+            $baseUnit = $product->base_unit ?: 'unit(s)';
+            $snapshot['units'] = ProductUnit::where('product_id', $product->id)
+                ->orderBy('sort_order')->orderBy('id')->get()
+                ->map(fn ($u) => sprintf(
+                    '%s = %s %s @ ₱%s (WS ₱%s)%s',
+                    $u->name,
+                    Quantity::format($u->conversion_factor),
+                    $baseUnit,
+                    number_format($u->price / 100, 2),
+                    number_format($u->wholesale_price / 100, 2),
+                    $u->is_default ? ' [default]' : ''
+                ))
+                ->values()
+                ->all();
+        }
+
+        return $snapshot;
     }
 }

@@ -7,6 +7,7 @@ use Illuminate\Http\Request;
 use App\Models\Product;
 use App\Models\Sale;
 use App\Models\SaleItem;
+use App\Support\Quantity;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Auth;
 
@@ -30,6 +31,8 @@ class PosController extends Controller
             'cart.*.quantity' => 'required|numeric|min:0.01',
             'cart.*.name' => 'nullable|string',
             'cart.*.price' => 'required|numeric',
+            'cart.*.product_unit_id' => 'nullable|integer',
+            'cart.*.is_wholesale' => 'nullable|boolean',
             // ADDED CREDIT AND DEBIT CARDS
             'payment_method' => 'required|string|in:cash,gcash,maya,card,credit_card,debit_card',
             'cash_given' => 'nullable|numeric',
@@ -104,7 +107,7 @@ class PosController extends Controller
             })->unique()->values()->toArray();
 
             $products = count($productIds) > 0
-                ? Product::whereIn('id', $productIds)->lockForUpdate()->get()->keyBy('id')
+                ? Product::with('units')->whereIn('id', $productIds)->lockForUpdate()->get()->keyBy('id')
                 : collect();
 
             // Resolve store_id once for all line items.
@@ -115,36 +118,93 @@ class PosController extends Controller
 
             // Process cart items in memory
             foreach ($request->cart as $item) {
-                $unitPrice = (int) round($item['price'] * 100);
-                $quantity = (float) $item['quantity'];
+                $requestedUnitPrice = Quantity::toInt(Quantity::multiply($item['price'], '100'));
+                $quantity = Quantity::normalize($item['quantity']);
 
                 if (isset($item['id']) && $item['id'] !== null && !is_string($item['id'])) {
-                    if ((int) $quantity != $quantity) {
-                        throw new \Exception('Product quantities must be whole numbers.');
-                    }
-
-                    $quantity = (int) $quantity;
                     $product = $products->get($item['id']);
 
                     if (!$product) {
                         throw new \Exception("Item no longer available in catalog.");
                     }
 
-                    if ($product->stock_quantity < $quantity) {
-                        throw new \Exception("Insufficient stock for {$product->name}. Only {$product->stock_quantity} remaining.");
+                    $isMultiple = $product->selling_method === Product::SELLING_METHOD_MULTIPLE;
+                    $unit = null;
+                    $unitName = null;
+                    $conversionFactor = '1';
+                    $baseQuantity = $quantity;
+                    $unitPrice = $requestedUnitPrice;
+
+                    if ($isMultiple) {
+                        $requestedUnitId = $item['product_unit_id'] ?? null;
+
+                        if ($requestedUnitId !== null && $requestedUnitId !== '') {
+                            $unit = $product->units->firstWhere('id', (int) $requestedUnitId);
+                            if (!$unit) {
+                                throw new \Exception("The selected selling unit for {$product->name} is no longer available.");
+                            }
+                        } else {
+                            $unit = $product->defaultUnit();
+                            if (!$unit) {
+                                throw new \Exception("No selling units are configured for {$product->name}.");
+                            }
+                        }
+
+                        // Cashier quantities follow the product's quantity decimals (e.g. 2 for meters)
+                        $precision = (int) $product->quantity_precision;
+                        if (Quantity::decimalPlaces($quantity) > $precision) {
+                            throw new \Exception($precision === 0
+                                ? "{$product->name} is sold in whole quantities only."
+                                : "{$product->name} allows up to {$precision} decimal place(s) per quantity.");
+                        }
+
+                        $unitName = $unit->name;
+                        $conversionFactor = Quantity::normalize($unit->conversion_factor);
+                        $baseQuantity = Quantity::multiply($quantity, $conversionFactor);
+
+                        $isWholesale = filter_var($item['is_wholesale'] ?? false, FILTER_VALIDATE_BOOLEAN);
+                        $unitPrice = $isWholesale ? (int) $unit->wholesale_price : (int) $unit->price;
+
+                        // Accept a client price only when it matches a configured tier.
+                        if (in_array($requestedUnitPrice, [(int) $unit->price, (int) $unit->wholesale_price], true)) {
+                            $unitPrice = $requestedUnitPrice;
+                        }
+                    } else {
+                        // Standard products keep their existing whole-number contract.
+                        if (!Quantity::isWhole($quantity)) {
+                            throw new \Exception('Product quantities must be whole numbers.');
+                        }
                     }
 
-                    // Decrement inventory level
-                    $product->decrement('stock_quantity', $quantity);
+                    if (Quantity::compare($baseQuantity, '0') <= 0) {
+                        throw new \Exception('Product quantities must be greater than zero.');
+                    }
 
-                    $subtotal = $unitPrice * $quantity;
+                    if (Quantity::compare($product->stock_quantity, $baseQuantity) < 0) {
+                        $baseLabel = $product->base_unit ?: 'unit(s)';
+                        throw new \Exception(
+                            "Insufficient stock for {$product->name}. Only "
+                            . Quantity::format($product->stock_quantity) . " {$baseLabel} remaining."
+                        );
+                    }
+
+                    // Deduct the converted base quantity from inventory.
+                    $newStock = Quantity::subtract($product->stock_quantity, $baseQuantity);
+                    $product->update(['stock_quantity' => $newStock]);
+
+                    $subtotal = Quantity::toInt(Quantity::multiply($unitPrice, $quantity));
 
                     $saleItemsToInsert[] = [
                         'sale_id' => $sale->id,
                         'product_id' => $product->id,
+                        'product_unit_id' => $unit ? $unit->id : null,
                         'custom_name' => $product->name,
+                        'unit_name' => $unitName,
+                        'conversion_factor' => $conversionFactor,
+                        'base_quantity' => $baseQuantity,
                         'quantity' => $quantity,
                         'unit_price' => $unitPrice,
+                        'cost_price_snapshot' => $product->cost_price,
                         'subtotal' => $subtotal,
                         'store_id' => $resolvedStoreId,
                         'created_at' => $now,
@@ -152,7 +212,7 @@ class PosController extends Controller
                     ];
                 } else {
                     // Custom item
-                    $subtotal = (int) round($unitPrice * $quantity);
+                    $subtotal = Quantity::toInt(Quantity::multiply($unitPrice, $quantity));
                     $customName = trim((string) ($item['name'] ?? ''));
 
                     $saleItemsToInsert[] = [

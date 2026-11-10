@@ -566,7 +566,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                 'Cashier / Staff',
                 'Shift Period',
                 'Duration',
-                'Starting Float',
+                'Starting Cash',
                 'Cash Sales',
                 'Expenses',
                 'Expected in Drawer',
@@ -719,7 +719,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
             };
             worksheet.getRow(startSummaryRow).height = 24;
 
-            // Metric Row 1: Counts and Float
+            // Metric Row 1: Counts and Starting Cash
             const r1 = startSummaryRow + 1;
             worksheet.getRow(r1).height = 22;
             worksheet.mergeCells(`A${r1}:B${r1}`);
@@ -727,7 +727,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
             worksheet.getCell(`A${r1}`).font = { bold: true, size: 9, color: { argb: '334155' } };
 
             worksheet.mergeCells(`C${r1}:D${r1}`);
-            worksheet.getCell(`C${r1}`).value = `Starting Float: ${formatCurrency(totalStarting)}`;
+            worksheet.getCell(`C${r1}`).value = `Starting Cash: ${formatCurrency(totalStarting)}`;
             worksheet.getCell(`C${r1}`).font = { bold: true, size: 9, color: { argb: '334155' } };
 
             worksheet.mergeCells(`E${r1}:F${r1}`);
@@ -868,7 +868,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                 'Cashier',
                 'Shift Period',
                 'Duration',
-                'Starting Float',
+                'Starting Cash',
                 'Cash Sales',
                 'Expenses',
                 'Expected',
@@ -996,7 +996,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
             doc.setFont(undefined, 'normal');
             doc.setTextColor(71, 85, 105);
 
-            // Col 1: Counts & Float
+            // Col 1: Counts & Starting Cash
             doc.text(`Total Shifts Recorded:`, col1X, contentY);
             doc.setFont(undefined, 'bold');
             doc.setTextColor(15, 23, 42);
@@ -1004,7 +1004,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
 
             doc.setFont(undefined, 'normal');
             doc.setTextColor(71, 85, 105);
-            doc.text(`Total Starting Float:`, col1X, contentY + 7);
+            doc.text(`Total Starting Cash:`, col1X, contentY + 7);
             doc.setFont(undefined, 'bold');
             doc.setTextColor(15, 23, 42);
             doc.text(`${formatCurrency(totalStarting)}`, col1X + 42, contentY + 7);
@@ -1084,7 +1084,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                     <h2 className="font-black text-xl text-gray-900 tracking-tight">Shift Accountability & History</h2>
                     <p className="text-xs font-semibold text-gray-500 mt-0.5">
                         {auth.user.is_admin
-                            ? 'Monitor employee work shifts, cash drawer reconciliation, starting floats, and discrepancies'
+                            ? 'Monitor employee work shifts, cash drawer reconciliation, starting cash, and discrepancies'
                             : 'Review your register work sessions, cash drawer balancing, and shift summaries'}
                     </p>
                 </div>
@@ -1141,7 +1141,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                                 </div>
                             </div>
                             <div className="mt-2.5 sm:mt-3 pt-2 sm:pt-3 border-t border-emerald-100 flex items-center justify-between text-[10px] sm:text-xs font-semibold text-emerald-700 gap-1">
-                                <span className="truncate">Starting Float Total</span>
+                                <span className="truncate">Starting Cash Total</span>
                                 <span className="font-bold text-emerald-800 truncate shrink-0">{formatCurrency(kpiMetrics.totalStartingCash)}</span>
                             </div>
                         </div>
@@ -1579,7 +1579,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                                                     <th className="py-3.5 px-4 whitespace-nowrap">Cashier / Staff</th>
                                                     <th className="py-3.5 px-4 whitespace-nowrap">Shift Period</th>
                                                     <th className="py-3.5 px-4 text-center whitespace-nowrap">Duration</th>
-                                                    <th className="py-3.5 px-4 text-right whitespace-nowrap">Starting Float</th>
+                                                    <th className="py-3.5 px-4 text-right whitespace-nowrap">Starting Cash</th>
                                                     <th className="py-3.5 px-4 text-right whitespace-nowrap">Cash Sales</th>
                                                     <th className="py-3.5 px-4 text-right whitespace-nowrap">Expenses</th>
                                                     <th className="py-3.5 px-4 text-right whitespace-nowrap">Expected</th>
@@ -1682,7 +1682,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                                                                     </span>
                                                                 </td>
 
-                                                                {/* Starting Float */}
+                                                                {/* Starting Cash */}
                                                                 <td className="py-3.5 px-4 text-right whitespace-nowrap font-bold text-gray-700 text-xs sm:text-sm">
                                                                     {formatCurrency(start)}
                                                                 </td>
@@ -1871,7 +1871,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
 
                                                         {/* Card Footer: Starting & Expected */}
                                                         <div className="mt-3 pt-3 border-t border-gray-100 flex justify-between items-center text-[11px] text-gray-500 font-semibold">
-                                                            <span>Float: {formatCurrency(start)}</span>
+                                                            <span>Starting Cash: {formatCurrency(start)}</span>
                                                             <span className="text-[#1B3B6A] font-bold flex items-center gap-1 group-hover:underline">
                                                                 <span>View Z-Read</span>
                                                                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-3.5 h-3.5">
@@ -2084,7 +2084,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                                             </div>
                                             <div className="text-[11px] opacity-85 flex justify-between">
                                                 <span>Expected: {formatCurrency(selectedShiftData.expected_opening_cash)}</span>
-                                                <span>Counted Float: {formatCurrency(selectedShiftData.starting_cash)}</span>
+                                                <span>Counted Starting Cash: {formatCurrency(selectedShiftData.starting_cash)}</span>
                                             </div>
                                         </div>
                                     )}
@@ -2096,7 +2096,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
                                         </div>
 
                                         <div className="flex justify-between items-center text-gray-600">
-                                            <span className="font-medium">Starting Cash Float</span>
+                                            <span className="font-medium">Starting Cash</span>
                                             <span className="font-bold text-gray-800">{formatCurrency(selectedShiftData.starting_cash)}</span>
                                         </div>
 
@@ -2107,7 +2107,7 @@ export default function ShiftHistory({ auth, initial_shifts, initial_terminals, 
 
                                         {Number(selectedShiftData.cash_in || 0) > 0 && (
                                             <div className="flex justify-between items-center text-emerald-600">
-                                                <span className="font-medium">+ Cash In / Float Top-up</span>
+                                                <span className="font-medium">+ Cash In / Cash Top-up</span>
                                                 <span className="font-black">+{formatCurrency(selectedShiftData.cash_in)}</span>
                                             </div>
                                         )}

@@ -66,7 +66,7 @@ class ActivityLog extends Model
             return 'Store Settings';
         }
 
-        if ($modelType === 'product') {
+        if ($modelType === 'product' || $modelType === 'inventory') {
             return 'Product Management';
         }
 
@@ -162,7 +162,7 @@ class ActivityLog extends Model
                     break;
 
                 case 'Product Management':
-                    $builder->where('model_type', 'Product');
+                    $builder->whereIn('model_type', ['Product', 'Inventory']);
                     break;
 
                 case 'Category Management':

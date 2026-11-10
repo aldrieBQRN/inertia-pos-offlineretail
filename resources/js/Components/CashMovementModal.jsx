@@ -138,7 +138,7 @@ export default function CashMovementModal({
             'Returned Delivery Cash Advance',
             'Added 1, 5, 10, 20 Coin Rolls',
             'Added 20, 50, 100 Small Bills',
-            'Register Float Replenishment'
+            'Register Cash Replenishment'
         ],
     };
 

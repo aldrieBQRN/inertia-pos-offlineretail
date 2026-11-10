@@ -8,6 +8,7 @@ import MobileScanner from '@/Components/MobileScanner';
 import CategoryManager from '@/Components/CategoryManager';
 import Swal from 'sweetalert2';
 import { printLabels, downloadLabelImage } from '@/Utils/printLabels';
+import { formatQty, formatProductQty, productQtyDecimals, defaultQuantityDecimals, repeatingFactorHint } from '@/Utils/quantity';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import ExcelJS from 'exceljs';
@@ -28,16 +29,163 @@ const LogRef = ({ value }) => {
     );
 };
 
-export default function Inventory({ auth, initial_products, initial_categories, initial_recent_activity, initial_stock_histories }) {
+// ---------------------------------------------------------------------------
+// Excel template / export / import layout
+// Rows 1-5 hold the store header (name, address, contact, title, spacer),
+// row 6 holds the column headers and data starts on row 7. Import locates the
+// header row by its contents, so older files (header on row 1, 7 columns) and
+// newer files (10 columns + Product Units sheet) both keep working.
+// ---------------------------------------------------------------------------
+const XLSX_HEADER_ROW = 6;
+const XLSX_FIRST_DATA_ROW = 7;
+// Grey italic sample rows shipped in the templates; skipped on import.
+const TEMPLATE_EXAMPLE_SKUS = new Set(['88010020', 'CEMENT-001', 'WIRE-001']);
+
+const PRODUCT_HEADER_RULES = [
+    [/wholesale/, 'wholesale_price'],
+    [/cost/, 'cost_price'],
+    [/retail|^price$|^srp$/, 'price'],
+    [/method/, 'selling_method'],
+    [/base unit/, 'base_unit'],
+    [/default unit/, 'default_unit'],
+    [/stock|qty|quantity/, 'stock_quantity'],
+    [/category/, 'category_name'],
+    [/sku|barcode/, 'sku'],
+    [/name/, 'name'],
+];
+const PRODUCT_DEFAULT_COLUMNS = {
+    sku: 1, name: 2, category_name: 3, price: 4, wholesale_price: 5, cost_price: 6,
+    stock_quantity: 7, selling_method: 8, base_unit: 9, default_unit: 10,
+};
+
+const UNIT_HEADER_RULES = [
+    [/wholesale/, 'wholesale_price'],
+    [/retail|^price$/, 'retail_price'],
+    [/conversion|factor/, 'conversion_factor'],
+    [/default/, 'is_default'],
+    [/sort|order/, 'sort_order'],
+    [/sku|barcode/, 'sku'],
+    [/unit|name/, 'unit_name'],
+];
+const UNIT_DEFAULT_COLUMNS = {
+    sku: 1, unit_name: 2, conversion_factor: 3, retail_price: 4, wholesale_price: 5, is_default: 6, sort_order: 7,
+};
+
+const normalizeHeader = (text) => String(text ?? '').toLowerCase().replace(/\s*\/\s*/g, '/').replace(/\s+/g, ' ').trim();
+
+const matchHeader = (rules, text) => {
+    const h = normalizeHeader(text);
+    if (!h) return null;
+    const rule = rules.find(([pattern]) => pattern.test(h));
+    return rule ? rule[1] : null;
+};
+
+/** Plain text of an ExcelJS cell (handles rich text, hyperlinks and formula results). */
+const xlsxCellText = (cell) => {
+    const v = cell?.value;
+    if (v === null || v === undefined) return '';
+    if (v instanceof Date) return v.toISOString();
+    if (typeof v === 'object') {
+        if (Array.isArray(v.richText)) return v.richText.map(t => t.text).join('');
+        if (v.text !== undefined) return String(v.text);
+        if (v.result !== undefined && v.result !== null) return String(v.result);
+        return '';
+    }
+    return String(v);
+};
+
+/** Numeric value of a cell/raw value, or null when blank / not a number. */
+const parseImportNumber = (val) => {
+    if (val === null || val === undefined) return null;
+    if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+    if (typeof val === 'object') {
+        if (typeof val.result === 'number') return val.result;
+        val = val.text ?? val.result ?? (Array.isArray(val.richText) ? val.richText.map(t => t.text).join('') : '');
+    }
+    let s = String(val).trim();
+    if (!s) return null;
+    if (s.includes(',') && s.includes('.')) s = s.replace(/,/g, '');
+    else if (s.includes(',')) s = s.replace(/,/g, '.');
+    s = s.replace(/[^0-9.\-]/g, '');
+    const n = parseFloat(s);
+    return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * Find the column-header row (first row whose column A looks like SKU/Barcode and
+ * whose column B matches `secondColumn`) and build a field -> column map from it.
+ * Store-header rows above it are ignored. Falls back to row 1 + default positions.
+ */
+const locateXlsxHeader = (sheet, secondColumn, rules, defaults) => {
+    let headerRow = 1;
+    const maxScan = Math.min(sheet.rowCount || 0, 30);
+    for (let r = 1; r <= maxScan; r++) {
+        const row = sheet.getRow(r);
+        const a = normalizeHeader(xlsxCellText(row.getCell(1)));
+        const b = normalizeHeader(xlsxCellText(row.getCell(2)));
+        // a !== b skips merged store-header rows (every merged cell reports the same text)
+        if (a && a !== b && /sku|barcode/.test(a) && secondColumn.test(b)) {
+            headerRow = r;
+            break;
+        }
+    }
+
+    const columns = { ...defaults };
+    const seen = new Set();
+    sheet.getRow(headerRow).eachCell({ includeEmpty: false }, (cell, colNumber) => {
+        const field = matchHeader(rules, xlsxCellText(cell));
+        if (field && !seen.has(field)) {
+            seen.add(field);
+            columns[field] = colNumber;
+        }
+    });
+    return { headerRow, columns };
+};
+
+/** "N/A" / "NA" / "-" placeholders in export/template cells mean "blank" on import. */
+const notApplicableToBlank = (value) => {
+    const s = String(value ?? '').trim();
+    return /^(n\/?a|-)$/i.test(s) ? '' : s;
+};
+
+const isTemplateExampleRow = (row, skuColumn, sku) =>
+    !!row.getCell(skuColumn).font?.italic && TEMPLATE_EXAMPLE_SKUS.has(sku);
+
+/** Split one CSV line, honouring double-quoted fields. */
+const splitCsvLine = (line) =>
+    line.split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/).map(v => v.trim().replace(/^"|"$/g, '').replace(/""/g, '"').trim());
+
+export default function Inventory({ auth, initial_products, initial_categories, initial_recent_activity, initial_stock_histories, initial_settings }) {
     const { auth: pageAuth } = usePage().props;
-    const currentAuth = auth || pageAuth;
+const currentAuth = auth || pageAuth;
     const user = currentAuth?.user;
     // Standalone POS: the single Admin account can use every inventory action
     const isAdmin = true;
-
+    const [settings] = useState(() => initial_settings || {});
     const [products, setProducts] = useState(() => initial_products || []);
     const [categories, setCategories] = useState(() => initial_categories || []);
-    const [settings, setSettings] = useState(null);
+
+    const COMMON_UNITS = [
+        'pcs', 'piece', 'pieces', 'set', 'kit',
+        'm', 'meter', 'meters', 'cm', 'centimeter', 'mm', 'millimeter',
+        'km', 'kilometer',
+        'kg', 'kilogram', 'g', 'gram', 'mg', 'milligram',
+        'L', 'liter', 'liters', 'ml', 'milliliter',
+        'roll', 'rolls', 'pack', 'packs', 'box', 'boxes',
+        'bag', 'bags', 'case', 'cases', 'crate', 'crates',
+        'sheet', 'sheets', 'pad', 'pads', 'ream', 'reams',
+        'dozen', 'gross', 'pair', 'pairs',
+        'ft', 'foot', 'feet', 'in', 'inch', 'yd', 'yard',
+        'lb', 'pound', 'oz', 'ounce',
+        'gal', 'gallon', 'qt', 'quart', 'pt', 'pint', 'cup',
+        'tbsp', 'tablespoon', 'tsp', 'teaspoon',
+    ];
+
+    // Custom unit suggestion dropdown states
+    const [baseUnitSuggestionsOpen, setBaseUnitSuggestionsOpen] = useState(false);
+    const [baseUnitHighlightedIndex, setBaseUnitHighlightedIndex] = useState(-1);
+    const [unitNameSuggestionsOpen, setUnitNameSuggestionsOpen] = useState({});
+    const [unitNameHighlightedIndex, setUnitNameHighlightedIndex] = useState({});
 
     const [currentPage, setCurrentPage] = useState(1);
     const [viewMode, setViewMode] = useState(() => (typeof window !== 'undefined' ? localStorage.getItem('pos_inv_view_mode') || 'table' : 'table'));
@@ -90,6 +238,12 @@ export default function Inventory({ auth, initial_products, initial_categories, 
     const [filterCategory, setFilterCategory] = useState('');
     const [activeDropdownId, setActiveDropdownId] = useState(null);
 
+    // Product whose selling units are shown in the "View Selling Units" modal (null = closed)
+    const [unitsViewProduct, setUnitsViewProduct] = useState(null);
+    // "Download Template" type chooser
+    const [showTemplateChooser, setShowTemplateChooser] = useState(false);
+    // Parsed import file awaiting confirmation (null = preview closed)
+    const [importPreview, setImportPreview] = useState(null);
     const [printState, setPrintState] = useState({
         isOpen: false,
         product: null,
@@ -346,7 +500,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             worksheet.getRow(4).height = 18;
 
             worksheet.mergeCells('A5:F5');
-            worksheet.getCell('A5').value = `SKU: ${product.sku || 'N/A'} | Current Stock: ${historyModal.data?.stats?.current_stock ?? product.stock_quantity} units | Generated: ${new Date().toLocaleString()}`;
+            worksheet.getCell('A5').value = `SKU: ${product.sku || 'N/A'} | Current Stock: ${fmtLedgerQty(historyModal.data?.stats?.current_stock ?? product.stock_quantity)} ${ledgerUnit()} | Generated: ${new Date().toLocaleString()}`;
             worksheet.getCell('A5').font = { color: { argb: '777777' }, size: 9 };
             worksheet.getCell('A5').alignment = { vertical: 'middle', horizontal: 'center' };
             worksheet.getRow(5).height = 16;
@@ -378,6 +532,8 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             let totalSold = 0;
             let totalAdded = 0;
             let totalInitial = 0;
+            let totalAdjusted = 0;
+            const unitLabel = ledgerUnit();
 
             timeline.forEach((row, idx) => {
                 const rowNum = idx + 8;
@@ -397,6 +553,9 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                     typeLabel = 'Initial Catalog';
                     typeColor = '2563EB'; // Blue
                     totalInitial += Math.abs(row.quantity_change || 0);
+                } else {
+                    totalAdjusted += Number(row.quantity_change || 0); // signed (e.g. lower physical count / void return)
+                    if (row.subtype === 'void_return') typeLabel = 'Void Return';
                 }
 
                 // Date
@@ -410,9 +569,9 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                 excelRow.getCell('B').font = { bold: true, color: { argb: typeColor }, size: 9 };
 
                 // Qty Change
-                const qtyVal = row.quantity_change || 0;
-                const formattedQty = qtyVal > 0 ? `+${qtyVal}` : `${qtyVal}`;
-                excelRow.getCell('C').value = formattedQty;
+                const qtyVal = Number(row.quantity_change || 0);
+                const sellingUnit = ledgerSellingUnit(row);
+                excelRow.getCell('C').value = `${ledgerQtyText(row)}${sellingUnit ? ` (${sellingUnit})` : ''}`;
                 excelRow.getCell('C').alignment = { vertical: 'middle', horizontal: 'center' };
                 excelRow.getCell('C').font = { bold: true, color: { argb: qtyVal < 0 ? 'DC2626' : (qtyVal > 0 ? '16A34A' : '64748B') }, size: 9 };
 
@@ -467,12 +626,12 @@ export default function Inventory({ auth, initial_products, initial_categories, 
 
             const summaryRow = worksheet.getRow(summaryStartRow + 2);
             summaryRow.getCell('A').value = `Total Recorded: ${timeline.length}`;
-            summaryRow.getCell('B').value = `Total Sold: -${totalSold}`;
-            summaryRow.getCell('C').value = `Total Restocked: +${totalAdded} (Initial: +${totalInitial})`;
-            summaryRow.getCell('D').value = `Current Stock: ${historyModal.data?.stats?.current_stock ?? product.stock_quantity}`;
+            summaryRow.getCell('B').value = `Total Sold: -${fmtLedgerQty(totalSold)} ${unitLabel}`;
+            summaryRow.getCell('C').value = `Total Restocked: +${fmtLedgerQty(totalAdded)} (Initial: +${fmtLedgerQty(totalInitial)})${totalAdjusted ? ` | Adjusted: ${totalAdjusted > 0 ? '+' : ''}${fmtLedgerQty(totalAdjusted)}` : ''}`;
+            summaryRow.getCell('D').value = `Current Stock: ${fmtLedgerQty(historyModal.data?.stats?.current_stock ?? product.stock_quantity)} ${unitLabel}`;
             summaryRow.getCell('E').value = `Total Revenue: ${formatCurrency(historyModal.data?.stats?.total_revenue || 0)}`;
-            const netFlow = totalInitial + totalAdded - totalSold;
-            summaryRow.getCell('F').value = `Net Flow: ${netFlow > 0 ? '+' : ''}${netFlow}`;
+            const netFlow = totalInitial + totalAdded + totalAdjusted - totalSold;
+            summaryRow.getCell('F').value = `Net Flow: ${netFlow > 0 ? '+' : ''}${fmtLedgerQty(netFlow)} ${unitLabel}`;
 
             ['A', 'B', 'C', 'D', 'E', 'F'].forEach(col => {
                 const cell = summaryRow.getCell(col);
@@ -493,6 +652,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             const safeProdName = (product.name || 'Product').replace(/[^a-zA-Z0-9_-]/g, '_');
             const dateStr = new Date().toISOString().split('T')[0];
             saveAs(blob, `${safeProdName}_Stock_Ledger_${dateStr}.xlsx`);
+            auditExport({ type: 'stock_ledger_excel', count: timeline.length, product_id: product.id, file_name: `${safeProdName}_Stock_Ledger_${dateStr}.xlsx` });
 
             Swal.fire({
                 icon: 'success',
@@ -516,6 +676,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
         const desc = (log.description || '').toLowerCase();
         const model = (log.model_type || '').toLowerCase();
         if (model === 'category') return 'category';
+        if (['import', 'import_failed', 'export'].includes(action)) return 'file';
         if (action.includes('sale') || desc.includes('sold')) return 'sale';
         if (action.includes('restock') || desc.includes('restock') || action.includes('stock')) return 'stock';
         if (desc.includes('registered new') || ((action === 'create' || action === 'created') && model === 'product')) return 'create';
@@ -685,7 +846,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                     typeColor = 'DC2626'; // Rose
                     salesCount++;
                 } else if (activityType === 'stock') {
-                    typeLabel = 'Restock';
+                    typeLabel = log.action === 'stock_void_return' ? 'Void Return' : 'Restock';
                     typeColor = '16A34A'; // Green
                     restockCount++;
                 } else if (activityType === 'create') {
@@ -695,6 +856,9 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                 } else if (activityType === 'category') {
                     typeLabel = 'Category';
                     typeColor = '7C3AED'; // Violet
+                } else if (activityType === 'file') {
+                    typeLabel = log.action === 'export' ? 'Export' : (log.action === 'import_failed' ? 'Import Rejected' : 'Import');
+                    typeColor = '0369A1'; // Sky
                 }
 
                 // Col A: Date & Time
@@ -811,6 +975,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             const safeStorePrefix = (settings?.store_name || 'POS').replace(/[^a-zA-Z0-9_-]/g, '_');
             const dateStr = new Date().toISOString().split('T')[0];
             saveAs(blob, `${safeStorePrefix}_Inventory_Activity_${dateStr}.xlsx`);
+            auditExport({ type: 'activity_excel', count: logs.length, file_name: `${safeStorePrefix}_Inventory_Activity_${dateStr}.xlsx` });
 
             Swal.fire({
                 icon: 'success',
@@ -876,12 +1041,73 @@ export default function Inventory({ auth, initial_products, initial_categories, 
         };
     }, [showModal]);
 
-    const [formData, setFormData] = useState({
-        name: '', category_id: '', price: '', cost_price: '', wholesale_price: '', stock_quantity: '', sku: '', image: null
+    const emptyUnitRow = (isDefault = false) => ({
+        name: '',
+        conversion_factor: '',
+        price: '',
+        wholesale_price: '',
+        is_default: isDefault,
     });
+
+    const [formData, setFormData] = useState({
+        name: '', category_id: '', price: '', cost_price: '', wholesale_price: '', stock_quantity: '', sku: '', image: null,
+        selling_method: 'standard', base_unit: '', quantity_decimals: '', units: [],
+    });
+
+    // Stock movement ledger quantities are in the product's base unit (Multiple UOM) or plain units
+    const ledgerUnit = () => {
+        const p = historyModal.data?.product || historyModal.product;
+        return p?.selling_method === 'multiple' && p?.base_unit ? p.base_unit : 'units';
+    };
+    const fmtLedgerQty = (n) => formatQty(n, productQtyDecimals(historyModal.data?.product || historyModal.product));
+    const ledgerQtyText = (row) => {
+        const q = Number(row.quantity_change || 0);
+        return `${q > 0 ? '+' : ''}${fmtLedgerQty(q)} ${ledgerUnit()}`;
+    };
+    /** "1 Roll" for sales rung up in a selling unit other than the base unit. */
+    const ledgerSellingUnit = (row) => (
+        row.type === 'sale' && row.unit_name && row.base_quantity !== undefined
+        && (Number(row.quantity) !== Number(row.base_quantity) || row.unit_name !== ledgerUnit())
+    ) ? `${fmtLedgerQty(row.quantity)} ${row.unit_name}` : null;
+
+    /** Record an export in the audit trail (fire-and-forget; never blocks the download). */
+    const auditExport = (payload) => {
+        axios.post('/api/inventory/export-log', payload).catch(() => {});
+    };
 
     const formatCurrency = (cents) => {
         return ((cents || 0) / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    };
+
+    /** Multiple-UOM products are priced by their default selling unit (falls back to the first unit). */
+    const productDefaultUnit = (product) => {
+        if (product?.selling_method !== 'multiple' || !product.units?.length) return null;
+        return product.units.find(u => u.is_default) || product.units[0];
+    };
+
+    const productRetailPrice = (product) => {
+        const unit = productDefaultUnit(product);
+        if (unit) return Number(unit.price) || 0;
+        return product?.selling_method === 'multiple' ? 0 : (product?.price || 0);
+    };
+
+    const productWholesalePrice = (product) => {
+        const unit = productDefaultUnit(product);
+        if (unit) return Number(unit.wholesale_price) || 0;
+        return product?.selling_method === 'multiple' ? 0 : (product?.wholesale_price || 0);
+    };
+
+    /** " / Roll" suffix for multiple-UOM prices so it is clear which unit the price is for. */
+    const productPriceUnitSuffix = (product) => {
+        const unit = productDefaultUnit(product);
+        return unit ? ` / ${unit.name}` : '';
+    };
+
+    const productUnitLabel = (product) => {
+        if (product?.selling_method === 'multiple') {
+            return product.base_unit || 'base unit';
+        }
+        return '';
     };
 
     // Sync preloaded server-side props on navigation
@@ -916,7 +1142,6 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             loadCategories();
             loadAllProducts(true);
         }
-        fetchSettings();
 
         const interval = setInterval(() => {
             loadAllProducts(false);
@@ -947,10 +1172,6 @@ export default function Inventory({ auth, initial_products, initial_categories, 
         setActiveDropdownId(null);
         setSelectedIds([]);
     }, [searchTerm, filterCategory, stockTab, sortBy]);
-
-    const fetchSettings = async () => {
-        try { const res = await axios.get('/api/settings'); setSettings(res.data); } catch (e) {}
-    };
 
     const loadAllProducts = async (showLoading = true) => {
         if (showLoading) setLoading(true);
@@ -1158,11 +1379,19 @@ export default function Inventory({ auth, initial_products, initial_categories, 
     };
 
     const handleQuickAdd = async (product) => {
-        const costPriceText = product.cost_price 
-            ? `${formatCurrency(product.cost_price)}` 
-            : '—';
+        const isMultiple = product.selling_method === 'multiple' || !!product.is_multi_unit;
+        const units = product.units || [];
+        const baseUnit = product.base_unit || 'unit';
+        const costPriceText = product.cost_price ? `${formatCurrency(product.cost_price)} / ${baseUnit}` : '—';
 
-        const { value: quantity } = await Swal.fire({
+        const unitOptions = isMultiple
+            ? [
+                `<option value="">${baseUnit} (base unit)</option>`,
+                ...units.map((unit) => `<option value="${unit.id}">${unit.name}</option>`),
+            ].join('')
+            : '';
+
+        const { value: payload } = await Swal.fire({
             title: `Restock: ${product.name}`,
             html: `
                 <div class="text-left bg-gray-50 p-4 rounded-lg border border-gray-200 mb-2">
@@ -1172,52 +1401,98 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                     </div>
                     <div class="flex justify-between text-sm py-1.5 border-t border-dashed border-gray-200 mt-1">
                         <span class="text-gray-500 font-bold">Current Stock:</span>
-                        <span class="text-gray-900 font-black">${product.stock_quantity} Left</span>
+                        <span class="text-gray-900 font-black">${product.stock_quantity} ${baseUnit}</span>
                     </div>
-                    <div class="flex justify-between text-sm py-1.5 border-t border-dashed border-gray-200 mt-1">
+                    ${isMultiple ? `
+                    <div class="mt-3 text-left">
+                        <label class="text-[11px] font-bold text-gray-500 uppercase tracking-wide">Receive as</label>
+                        <select id="swal-restock-unit" class="swal2-select w-full mt-1" style="display:flex;margin:0;width:100%;max-width:100%;">
+                            ${unitOptions}
+                        </select>
+                    </div>` : ''}
+                    <div class="mt-3 text-left">
+                        <label class="text-[11px] font-bold text-gray-500 uppercase tracking-wide">Quantity to add</label>
+                        <input id="swal-restock-qty" type="number" step="0.00000001" min="0.00000001" class="swal2-input w-full mt-1" style="display:flex;margin:0;width:100%;max-width:100%;" placeholder="Enter amount..." />
+                    </div>
+                    <div class="flex justify-between text-sm py-1.5 border-t border-dashed border-gray-200 mt-3">
                         <span class="text-indigo-600 font-bold">Total Restock Cost:</span>
                         <span class="text-indigo-600 font-black text-base" id="swal-total-cost">0.00</span>
                     </div>
+                    ${isMultiple ? `
+                    <div class="flex justify-between text-sm py-1.5 border-t border-dashed border-gray-200 mt-1">
+                        <span class="text-slate-500 font-bold">Equivalent Base Quantity:</span>
+                        <span class="text-slate-900 font-black text-base" id="swal-base-qty">0 ${baseUnit}</span>
+                    </div>` : ''}
                 </div>
             `,
-            input: 'number',
-            inputLabel: 'Quantity to add to current inventory',
-            inputPlaceholder: 'Enter amount...',
             showCancelButton: true,
             confirmButtonText: 'Update Stock',
             confirmButtonColor: '#3085d6',
-            inputValidator: (value) => {
-                if (!value || value <= 0) return 'Please enter a valid positive number.';
+            focusConfirm: false,
+            preConfirm: () => {
+                const quantityInput = document.getElementById('swal-restock-qty');
+                const unitSelect = document.getElementById('swal-restock-unit');
+                const quantity = parseFloat(quantityInput?.value || '0');
+
+                if (!quantity || quantity <= 0) {
+                    Swal.showValidationMessage('Please enter a valid positive quantity.');
+                    return false;
+                }
+
+                return { quantity, unit_id: unitSelect?.value || null };
             },
             didOpen: () => {
-                const input = Swal.getInput();
+                const quantityInput = document.getElementById('swal-restock-qty');
+                const unitSelect = document.getElementById('swal-restock-unit');
                 const totalCostEl = document.getElementById('swal-total-cost');
-                if (input && totalCostEl) {
-                    input.addEventListener('input', (e) => {
-                        const qty = parseFloat(e.target.value) || 0;
-                        const costPrice = product.cost_price ? product.cost_price / 100 : 0;
-                        const totalCost = qty * costPrice;
+
+                const getFactor = () => {
+                    if (!isMultiple || !unitSelect?.value) return 1;
+                    const selectedUnit = units.find((unit) => String(unit.id) === String(unitSelect.value));
+                    return selectedUnit ? Number(selectedUnit.conversion_factor) || 1 : 1;
+                };
+
+                const updateTotal = () => {
+                    const qty = parseFloat(quantityInput?.value || '0') || 0;
+                    const factor = getFactor();
+                    const costPrice = product.cost_price ? product.cost_price / 100 : 0;
+                    const totalCost = qty * factor * costPrice;
+                    if (totalCostEl) {
                         totalCostEl.textContent = totalCost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                    });
-                }
+                    }
+                    const baseQtyEl = document.getElementById('swal-base-qty');
+                    if (baseQtyEl) {
+                        baseQtyEl.textContent = `${(qty * factor).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 6 })} ${baseUnit}`;
+                    }
+                };
+
+                quantityInput?.addEventListener('input', updateTotal);
+                unitSelect?.addEventListener('change', updateTotal);
             }
         });
 
-        if (quantity) {
+        if (payload?.quantity) {
             try {
-                const parsedQuantity = parseInt(quantity, 10);
-                await axios.post(`/api/products/${product.id}/stock`, { quantity: parsedQuantity });
+                const requestBody = { quantity: payload.quantity };
+                if (payload.unit_id) requestBody.unit_id = payload.unit_id;
+
+                await axios.post(`/api/products/${product.id}/stock`, requestBody);
                 Swal.fire({ icon: 'success', title: 'Stock Updated', toast: true, position: 'top-end', showConfirmButton: false, timer: 1500 });
 
+                const factor = payload.unit_id
+                    ? Number(units.find((unit) => String(unit.id) === String(payload.unit_id))?.conversion_factor) || 1
+                    : 1;
+                const baseAdded = payload.quantity * factor;
+
                 setProducts(prevProducts =>
-                    prevProducts.map(p => p.id === product.id ? { ...p, stock_quantity: Number(p.stock_quantity) + parsedQuantity } : p)
+                    prevProducts.map(p => p.id === product.id ? { ...p, stock_quantity: Number(p.stock_quantity) + baseAdded } : p)
                 );
 
                 if (historyModal.isOpen && String(historyModal.product?.id) === String(product.id)) {
                     await openStockHistory(product, false);
                 }
             } catch (error) {
-                Swal.fire('Error', 'Failed to update stock levels.', 'error');
+                Swal.fire('Error', error?.response?.data?.error || 'Failed to update stock levels.', 'error');
             }
         }
     };
@@ -1307,31 +1582,86 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             let totalWholesaleValue = 0;
             let totalCostValue = 0;
             let totalItemsCount = 0;
+            let multiUomCount = 0;
             let lowStockCount = 0;
 
-            exportData.forEach(p => {
-                const status = p.stock_quantity <= 10 ? 'Low Stock' : 'In Stock';
-                if (p.stock_quantity <= 10) lowStockCount++;
+            const money = (v) => Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            const qtyText = (v) => Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 4 });
+            const ROW_FILLS = [[255, 255, 255], [245, 247, 250]];
+            const UNIT_ROW_FILL = [238, 242, 255];
 
-                const cost = (p.cost_price || 0) / 100;
-                const wholesale = (p.wholesale_price || 0) / 100;
-                const retail = (p.price || 0) / 100;
-                const qty = p.stock_quantity || 0;
+            exportData.forEach((p, idx) => {
+                const qty = Number(p.stock_quantity) || 0;
+                const isLow = qty <= 10;
+                if (isLow) lowStockCount++;
+                const status = isLow ? 'Low Stock' : 'In Stock';
+                const cost = (p.cost_price || 0) / 100; // per base unit for Multiple UOM
+                const fill = ROW_FILLS[idx % 2];
+                const cell = (content, extra = {}) => ({ content, styles: { fillColor: fill, ...extra } });
 
-                totalCostValue += (cost * qty);
-                totalWholesaleValue += (wholesale * qty);
-                totalRetailValue += (retail * qty);
-                totalItemsCount += qty;
+                totalCostValue += cost * qty;
+
+                const isMulti = p.selling_method === 'multiple' || p.is_multi_unit;
+                if (!isMulti) {
+                    const wholesale = (p.wholesale_price || 0) / 100;
+                    const retail = (p.price || 0) / 100;
+                    totalWholesaleValue += wholesale * qty;
+                    totalRetailValue += retail * qty;
+                    totalItemsCount += qty;
+
+                    tableRows.push([
+                        cell(p.sku || 'N/A'),
+                        cell(p.name || 'Unknown Product'),
+                        cell(p.category?.name || 'Uncategorized'),
+                        cell(money(cost)),
+                        cell(money(wholesale)),
+                        cell(money(retail)),
+                        cell(qtyText(qty)),
+                        cell(status),
+                    ]);
+                    return;
+                }
+
+                // Multiple UOM: prices shown for the default selling unit, stock & cost in base units
+                multiUomCount++;
+                const baseUnit = p.base_unit || 'unit';
+                const units = [...(p.units || [])].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+                const def = units.find(u => u.is_default) || units[0] || null;
+                const defFactor = Number(def?.conversion_factor) || 0;
+                const defRetail = (def?.price || 0) / 100;
+                const defWholesale = (def?.wholesale_price || 0) / 100;
+
+                // Valuation per base unit = default unit price / its conversion factor
+                if (defFactor > 0) {
+                    totalRetailValue += (defRetail / defFactor) * qty;
+                    totalWholesaleValue += (defWholesale / defFactor) * qty;
+                }
 
                 tableRows.push([
-                    p.sku || 'N/A',
-                    p.name || 'Unknown Product',
-                    p.category?.name || 'Uncategorized',
-                    cost.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-                    wholesale.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-                    retail.toLocaleString('en-US', { minimumFractionDigits: 2 }),
-                    qty.toString(),
-                    status
+                    cell(p.sku || 'N/A'),
+                    cell(p.name || 'Unknown Product'),
+                    cell(p.category?.name || 'Uncategorized'),
+                    cell(`${money(cost)} / ${baseUnit}`),
+                    cell(def ? `${money(defWholesale)} / ${def.name}` : 'N/A'),
+                    cell(def ? `${money(defRetail)} / ${def.name}` : 'N/A'),
+                    cell(`${formatProductQty(p, qty)} ${baseUnit}`),
+                    cell(status),
+                ]);
+
+                const unitsText = units.length
+                    ? units.map(u =>
+                        `${u.name}${u.is_default ? ' (default)' : ''} = ${qtyText(u.conversion_factor)} ${baseUnit}: ` +
+                        `Retail ${money((u.price || 0) / 100)}, WS ${money((u.wholesale_price || 0) / 100)}`
+                    ).join('   |   ')
+                    : 'No selling units configured';
+
+                tableRows.push([
+                    { content: '' , styles: { fillColor: UNIT_ROW_FILL } },
+                    {
+                        content: `Selling units: ${unitsText}`,
+                        colSpan: 7,
+                        styles: { fillColor: UNIT_ROW_FILL, fontSize: 7.5, textColor: [55, 65, 81], cellPadding: { top: 2, bottom: 3, left: 4, right: 4 } }
+                    },
                 ]);
             });
 
@@ -1339,10 +1669,16 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                 head: [tableColumns],
                 body: tableRows,
                 startY: tableStartY,
-                theme: 'striped',
+                theme: 'plain',
                 headStyles: { fillColor: '#1B3A69', textColor: 255, fontStyle: 'bold' },
                 styles: { fontSize: 9, cellPadding: 4, valign: 'middle' },
+                columnStyles: { 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' }, 6: { halign: 'right' } },
                 didParseCell: function(data) {
+                    // Selling-unit detail rows span columns; keep them left-aligned
+                    if (data.section === 'body' && data.cell.colSpan > 1) {
+                        data.cell.styles.halign = 'left';
+                        return;
+                    }
                     if (data.section === 'body' && data.column.index === 7) {
                         if (data.cell.raw === 'Low Stock') {
                             data.cell.styles.textColor = [220, 38, 38];
@@ -1358,7 +1694,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             let finalY = doc.lastAutoTable ? doc.lastAutoTable.finalY + 15 : tableStartY + 20;
 
             // If the table went too far down, add a new page for the summary so it doesn't cut off
-            if (finalY > 160) {
+            if (finalY > 150) {
                 doc.addPage();
                 finalY = 20;
             }
@@ -1366,7 +1702,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             // Draw Summary Box Background
             doc.setFillColor(249, 250, 251); // bg-gray-50
             doc.setDrawColor(229, 231, 235); // border-gray-200
-            doc.rect(14, finalY, pageWidth - 28, 42, 'FD');
+            doc.rect(14, finalY, pageWidth - 28, 48, 'FD');
 
             // Summary Box Title
             doc.setFontSize(12);
@@ -1380,8 +1716,10 @@ export default function Inventory({ auth, initial_products, initial_categories, 
 
             // Left Column: Items Stats
             doc.text(`Total Unique Items: ${exportData.length}`, 20, finalY + 18);
-            doc.text(`Total Stock Quantity: ${totalItemsCount}`, 20, finalY + 25);
-            doc.text(`Low Stock Alerts: ${lowStockCount}`, 20, finalY + 32);
+            // Multiple UOM stock is in different base units (meter, kg...), so it is not added here
+            doc.text(`Total Stock Quantity (Standard): ${qtyText(totalItemsCount)}`, 20, finalY + 25);
+            doc.text(`Multiple UOM Products: ${multiUomCount}`, 20, finalY + 32);
+            doc.text(`Low Stock Alerts: ${lowStockCount}`, 20, finalY + 39);
 
             // Middle Column: Valuation (Cost & Wholesale)
             doc.text(`Total Cost: ${totalCostValue.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, pageWidth / 2 - 40, finalY + 18);
@@ -1391,6 +1729,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             const dateStr = new Date().toISOString().split('T')[0];
             const safeStorePrefix = (settings?.store_name || 'POS').replace(/[^a-zA-Z0-9_-]/g, '_');
             doc.save(`${safeStorePrefix}_Inventory_Report_${dateStr}.pdf`);
+            auditExport({ type: 'inventory_pdf', count: exportData.length, filters: filterText, file_name: `${safeStorePrefix}_Inventory_Report_${dateStr}.pdf` });
             Swal.fire({ icon: 'success', title: 'PDF Exported!', toast: true, position: 'top-end', showConfirmButton: false, timer: 3000 });
 
         } catch (error) {
@@ -1401,157 +1740,128 @@ export default function Inventory({ auth, initial_products, initial_categories, 
         }
     };
 
-    const downloadTemplate = async () => {
+    /** Rows 1-5: store name, address, contact, title, spacer (same layout as before Multiple UOM). */
+    const writeStoreHeader = (sheet, lastCol, title) => {
+        const storeName = settings?.store_name || 'POS Store';
+        const storeAddress = settings?.address || '';
+        const storeContact = settings?.phone ? `Contact: ${settings.phone}` : '';
+
+        const lines = [
+            { value: storeName.toUpperCase(), font: { bold: true, color: { argb: '1B3A69' }, size: 16 }, height: 28 },
+            { value: storeAddress, font: { color: { argb: '555555' }, size: 9 }, height: 16 },
+            { value: storeContact, font: { color: { argb: '555555' }, size: 9, italic: true }, height: 16 },
+            { value: title, font: { bold: true, color: { argb: '333333' }, size: 11 }, height: 20 },
+        ];
+        lines.forEach((line, i) => {
+            const r = i + 1;
+            sheet.mergeCells(`A${r}:${lastCol}${r}`);
+            const cell = sheet.getCell(`A${r}`);
+            cell.value = line.value;
+            cell.font = line.font;
+            cell.alignment = { vertical: 'middle', horizontal: 'center' };
+            sheet.getRow(r).height = line.height;
+        });
+        sheet.getRow(5).height = 10;
+    };
+
+    /** Row 6: navy column headers. `rightCols` = 0-based indexes of numeric (right-aligned) columns. */
+    const writeColumnHeaders = (sheet, headers, rightCols) => {
+        const row = sheet.getRow(XLSX_HEADER_ROW);
+        headers.forEach((h, colIndex) => {
+            const cell = row.getCell(colIndex + 1);
+            cell.value = h;
+            cell.font = { bold: true, color: { argb: 'FFFFFF' }, size: 10 };
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: '1B3A69' } };
+            cell.alignment = { vertical: 'middle', horizontal: rightCols.includes(colIndex) ? 'right' : 'left' };
+        });
+        row.height = 25;
+    };
+
+    const PRODUCT_COLUMN_HEADERS = [
+        'SKU / Barcode', 'Product Name', 'Category Name', 'Retail Price', 'Wholesale Price',
+        'Cost Price', 'Stock Quantity', 'Selling Method', 'Base Unit', 'Default Unit'
+    ];
+    const PRODUCT_NUMERIC_COLS = [3, 4, 5, 6]; // Retail, Wholesale, Cost, Stock
+    const UNIT_NUMERIC_COLS = [2, 3, 4];       // Conversion Factor, Retail, Wholesale
+    const UNIT_COLUMN_HEADERS = ['SKU / Barcode', 'Unit Name', 'Conversion Factor', 'Retail Price', 'Wholesale Price', 'Is Default', 'Sort Order'];
+
+    const styleProductRow = (row, numCols) => {
+        const align = ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'left', 'left', 'left'];
+        for (let c = 1; c <= numCols; c++) row.getCell(c).alignment = { horizontal: align[c - 1] };
+        row.getCell(4).numFmt = '#,##0.00';
+        row.getCell(5).numFmt = '#,##0.00';
+        row.getCell(6).numFmt = '#,##0.00';
+        row.getCell(7).numFmt = 'General';
+    };
+
+    /** Whole numbers as #,##0; fractional quantities/factors keep their decimals. */
+    const quantityFormat = (n) => (Number.isInteger(Number(n)) ? '#,##0' : '#,##0.########');
+    /** Stock cell format: product precision (value stays exact for re-import). */
+    const stockCellFormat = (product, n) => {
+        const d = productQtyDecimals(product);
+        return Number.isInteger(Number(n)) || d === 0 ? '#,##0' : `#,##0.${'0'.repeat(d)}`;
+    };
+
+    const styleUnitRow = (row) => {
+        const align = ['left', 'left', 'right', 'right', 'right', 'center', 'center'];
+        for (let c = 1; c <= 7; c++) row.getCell(c).alignment = { horizontal: align[c - 1] };
+        row.getCell(3).numFmt = 'General';
+        row.getCell(4).numFmt = '#,##0.00';
+        row.getCell(5).numFmt = '#,##0.00';
+    };
+
+    const applyExampleStyle = (row, numCols) => {
+        for (let c = 1; c <= numCols; c++) {
+            row.getCell(c).font = { italic: true, color: { argb: '6B7280' } };
+            row.getCell(c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'F3F4F6' } };
+        }
+    };
+
+    const downloadTemplate = () => setShowTemplateChooser(true);
+
+    const generateTemplate = async (isComplete) => {
+        setShowTemplateChooser(false);
+        const numCols = isComplete ? 10 : 7;
+        const lastCol = isComplete ? 'J' : 'G';
+        const lastDataRow = XLSX_FIRST_DATA_ROW + 199; // 200 entry rows
+
         try {
             const workbook = new ExcelJS.Workbook();
-            const worksheet = workbook.addWorksheet('Products Template', {
-                views: [{ showGridLines: true }]
+
+            // ============================================================
+            // WORKSHEET 1: Products (always present)
+            // ============================================================
+            const productsSheet = workbook.addWorksheet('Products', {
+                views: [{ showGridLines: true, state: 'frozen', ySplit: XLSX_HEADER_ROW }]
             });
 
-            // Set column widths
-            worksheet.getColumn('A').width = 20; // Barcode/SKU
-            worksheet.getColumn('B').width = 30; // Product Name
-            worksheet.getColumn('C').width = 25; // Category Name
-            worksheet.getColumn('D').width = 15; // Retail Price
-            worksheet.getColumn('E').width = 18; // Wholesale Price
-            worksheet.getColumn('F').width = 15; // Cost Price
-            worksheet.getColumn('G').width = 15; // Stock Quantity
+            const widths = isComplete ? [22, 35, 25, 18, 18, 18, 16, 18, 15, 18] : [20, 30, 25, 15, 18, 15, 15];
+            widths.forEach((w, i) => { productsSheet.getColumn(i + 1).width = w; });
 
-            // Add Store Header (Rows 1 to 4)
-            const storeName = settings?.store_name || 'POS Store';
-            const storeAddress = settings?.address || '';
-            const storeContact = settings?.phone ? `Contact: ${settings.phone}` : '';
+            writeStoreHeader(productsSheet, lastCol, isComplete ? 'COMPLETE PRODUCT IMPORT TEMPLATE' : 'PRODUCT DATA IMPORT TEMPLATE');
+            writeColumnHeaders(productsSheet, isComplete ? PRODUCT_COLUMN_HEADERS : PRODUCT_COLUMN_HEADERS.slice(0, 7), PRODUCT_NUMERIC_COLS);
+            productsSheet.autoFilter = { from: { row: XLSX_HEADER_ROW, column: 1 }, to: { row: XLSX_HEADER_ROW, column: numCols } };
 
-            // Store Name
-            worksheet.mergeCells('A1:G1');
-            worksheet.getCell('A1').value = storeName.toUpperCase();
-            worksheet.getCell('A1').font = { bold: true, color: { argb: '1B3A69' }, size: 14 };
-            worksheet.getCell('A1').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(1).height = 24;
-
-            // Address
-            worksheet.mergeCells('A2:G2');
-            worksheet.getCell('A2').value = storeAddress;
-            worksheet.getCell('A2').font = { color: { argb: '555555' }, size: 9 };
-            worksheet.getCell('A2').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(2).height = 16;
-
-            // Contact (Phone)
-            worksheet.mergeCells('A3:G3');
-            worksheet.getCell('A3').value = storeContact;
-            worksheet.getCell('A3').font = { color: { argb: '555555' }, size: 9, italic: true };
-            worksheet.getCell('A3').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(3).height = 16;
-
-            // Title
-            worksheet.mergeCells('A4:G4');
-            worksheet.getCell('A4').value = 'PRODUCT DATA IMPORT TEMPLATE';
-            worksheet.getCell('A4').font = { bold: true, color: { argb: '333333' }, size: 10 };
-            worksheet.getCell('A4').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(4).height = 18;
-
-            // Empty spacing row
-            worksheet.getRow(5).height = 10;
-
-            // Header styling (Row 6)
-            const headers = ['Barcode/SKU', 'Product Name', 'Category Name', 'Retail Price', 'Wholesale Price', 'Cost Price', 'Stock Quantity'];
-            headers.forEach((h, colIndex) => {
-                const cell = worksheet.getRow(6).getCell(colIndex + 1);
-                cell.value = h;
-                cell.font = { bold: true, color: { argb: 'FFFFFF' }, size: 10 };
-                cell.fill = {
-                    type: 'pattern',
-                    pattern: 'solid',
-                    fgColor: { argb: '1B3A69' }
-                };
-                cell.alignment = { vertical: 'middle', horizontal: colIndex >= 3 ? 'right' : 'left' };
-            });
-            worksheet.getRow(6).height = 25;
-
-            // Generate category validation list from active system categories
             const catNames = categories.map(c => c.name).filter(Boolean);
             const listSource = catNames.length > 0 ? catNames : ['Clothing & Apparel', 'Electronics', 'Home & Garden', 'Sports & Outdoors', 'Accessories'];
-            const defaultCategory = listSource[0];
 
-            // Create a hidden worksheet to store category validation values
-            const categoriesSheet = workbook.addWorksheet('CategoryList');
-            categoriesSheet.state = 'hidden';
-            listSource.forEach((name, index) => {
-                categoriesSheet.getCell(`A${index + 1}`).value = name;
-            });
+            // Example rows (grey italic - skipped automatically on import)
+            const examples = isComplete
+                ? [
+                    ['CEMENT-001', 'Portland Cement', 'Construction', 220, 200, 180, 50, 'Standard', 'N/A', 'N/A'],
+                    ['WIRE-001', 'Electrical Wire', 'Electrical', 8.00, 7.00, 5.00, 1000, 'Multiple UOM', 'Meter', 'Meter'],
+                ]
+                : [['88010020', 'Sample Product A', listSource[0], 150.00, 130.00, 100.00, 50]];
 
-            // Add sample row at Row 7
-            worksheet.addRow({
-                sku: '88010020',
-                name: 'Sample Product A',
-                category_name: defaultCategory,
-                price: 150.00,
-                wholesale_price: 130.00,
-                cost_price: 100.00,
-                stock_quantity: 50
-            });
+            const altFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'F8FAFC' } };
 
-            // Enable worksheet protection to lock header cells (Rows 1 to 6)
-            worksheet.protect('', {
-                selectLockedCells: true,
-                selectUnlockedCells: true
-            });
-
-            // Set styling, validation, and unlock data cells (rows 7 to 206)
-            for (let i = 7; i <= 206; i++) {
-                const row = worksheet.getRow(i);
-                
-                // Align columns appropriately
-                row.getCell('A').alignment = { horizontal: 'left' };
-                row.getCell('B').alignment = { horizontal: 'left' };
-                row.getCell('C').alignment = { horizontal: 'left' };
-                row.getCell('D').alignment = { horizontal: 'right' };
-                row.getCell('E').alignment = { horizontal: 'right' };
-                row.getCell('F').alignment = { horizontal: 'right' };
-                row.getCell('G').alignment = { horizontal: 'right' };
-
-                // Number formatting
-                row.getCell('D').numFmt = '#,##0.00';
-                row.getCell('E').numFmt = '#,##0.00';
-                row.getCell('F').numFmt = '#,##0.00';
-                row.getCell('G').numFmt = '#,##0';
-
-                // Unlock data entry cells for editing on protected sheet
-                row.getCell('A').protection = { locked: false };
-                row.getCell('B').protection = { locked: false };
-                row.getCell('C').protection = { locked: false };
-                row.getCell('D').protection = { locked: false };
-                row.getCell('E').protection = { locked: false };
-                row.getCell('F').protection = { locked: false };
-                row.getCell('G').protection = { locked: false };
-
-                // Data Validations (ALL required: allowBlank: false)
-                // Barcode/SKU
-                row.getCell('A').dataValidation = {
-                    type: 'custom',
-                    formulae: [`LEN(TRIM(A${i}))>0`],
-                    allowBlank: false,
-                    showErrorMessage: true,
-                    errorTitle: 'Field Required',
-                    error: 'Barcode/SKU is required. You cannot leave this field blank.',
-                    promptTitle: 'Barcode/SKU',
-                    prompt: 'Enter unique Barcode or SKU.'
-                };
-
-                // Product Name
-                row.getCell('B').dataValidation = {
-                    type: 'custom',
-                    formulae: [`LEN(TRIM(B${i}))>0`],
-                    allowBlank: false,
-                    showErrorMessage: true,
-                    errorTitle: 'Field Required',
-                    error: 'Product Name is required. You cannot leave this field blank.',
-                    promptTitle: 'Product Name',
-                    prompt: 'Enter product name.'
-                };
-
-                // Category dropdown
-                row.getCell('C').dataValidation = {
+            for (let i = XLSX_FIRST_DATA_ROW; i <= lastDataRow; i++) {
+                const row = productsSheet.getRow(i);
+                styleProductRow(row, numCols);
+                if ((i - XLSX_FIRST_DATA_ROW) % 2 === 1) {
+                    for (let c = 1; c <= numCols; c++) row.getCell(c).fill = altFill;
+                }
+                row.getCell(3).dataValidation = {
                     type: 'list',
                     allowBlank: false,
                     formulae: [`CategoryList!$A$1:$A$${listSource.length}`],
@@ -1561,255 +1871,267 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                     promptTitle: 'Select Category',
                     prompt: 'Choose a category to ensure correct import matching.'
                 };
-
-                // Retail Price
-                row.getCell('D').dataValidation = {
-                    type: 'decimal',
-                    operator: 'greaterThanOrEqual',
-                    formulae: [0],
-                    allowBlank: false,
-                    showErrorMessage: true,
-                    errorTitle: 'Field Required',
-                    error: 'Retail Price is required and must be a positive number.',
-                    promptTitle: 'Retail Price',
-                    prompt: 'Enter selling price (e.g. 15.50).'
-                };
-
-                // Wholesale Price
-                row.getCell('E').dataValidation = {
-                    type: 'decimal',
-                    operator: 'greaterThanOrEqual',
-                    formulae: [0],
-                    allowBlank: false,
-                    showErrorMessage: true,
-                    errorTitle: 'Field Required',
-                    error: 'Wholesale Price is required and must be a positive number.',
-                    promptTitle: 'Wholesale Price',
-                    prompt: 'Enter wholesale price (e.g. 13.00).'
-                };
-
-                // Cost Price
-                row.getCell('F').dataValidation = {
-                    type: 'decimal',
-                    operator: 'greaterThanOrEqual',
-                    formulae: [0],
-                    allowBlank: false,
-                    showErrorMessage: true,
-                    errorTitle: 'Field Required',
-                    error: 'Cost Price is required and must be a positive number.',
-                    promptTitle: 'Cost Price',
-                    prompt: 'Enter cost price (e.g. 10.00).'
-                };
-
-                // Stock Quantity
-                row.getCell('G').dataValidation = {
-                    type: 'whole',
-                    operator: 'greaterThanOrEqual',
-                    formulae: [0],
-                    allowBlank: false,
-                    showErrorMessage: true,
-                    errorTitle: 'Field Required',
-                    error: 'Stock Quantity is required and must be a positive integer.',
-                    promptTitle: 'Stock Quantity',
-                    prompt: 'Enter current stock count.'
-                };
+                if (isComplete) {
+                    row.getCell(8).dataValidation = {
+                        type: 'list',
+                        allowBlank: true,
+                        formulae: ['"Standard,Multiple UOM"'],
+                        showErrorMessage: true,
+                        errorTitle: 'Invalid Selling Method',
+                        error: 'Choose "Standard" or "Multiple UOM".'
+                    };
+                }
             }
 
-            // Highlight empty cells in soft red if the row is partially filled
-            worksheet.addConditionalFormatting({
-                ref: 'A2:G200',
-                rules: [
-                    {
-                        type: 'expression',
-                        formulae: ['AND(A2="", COUNTA($A2:$G2)>0)'],
-                        style: {
-                            fill: {
-                                type: 'pattern',
-                                pattern: 'solid',
-                                bgColor: { argb: 'FEE2E2' },
-                                fgColor: { argb: 'FEE2E2' }
-                            },
-                            font: {
-                                color: { argb: '991B1B' },
-                                bold: true
-                            }
-                        }
-                    }
-                ]
+            examples.forEach((values, idx) => {
+                const row = productsSheet.getRow(XLSX_FIRST_DATA_ROW + idx);
+                values.forEach((v, c) => { row.getCell(c + 1).value = v; });
+                applyExampleStyle(row, numCols);
             });
+
+            // Hidden category list for the dropdown
+            const categoriesSheet = workbook.addWorksheet('CategoryList');
+            categoriesSheet.state = 'hidden';
+            listSource.forEach((name, index) => {
+                categoriesSheet.getCell(`A${index + 1}`).value = name;
+            });
+
+            // ============================================================
+            // WORKSHEET 2: Product Units (only in Complete template)
+            // ============================================================
+            if (isComplete) {
+                const unitsSheet = workbook.addWorksheet('Product Units', {
+                    views: [{ showGridLines: true, state: 'frozen', ySplit: XLSX_HEADER_ROW }]
+                });
+                [22, 25, 20, 18, 18, 12, 12].forEach((w, i) => { unitsSheet.getColumn(i + 1).width = w; });
+
+                writeStoreHeader(unitsSheet, 'G', 'PRODUCT UNITS (MULTIPLE UOM)');
+                writeColumnHeaders(unitsSheet, UNIT_COLUMN_HEADERS, UNIT_NUMERIC_COLS);
+                unitsSheet.autoFilter = { from: { row: XLSX_HEADER_ROW, column: 1 }, to: { row: XLSX_HEADER_ROW, column: 7 } };
+
+                for (let i = XLSX_FIRST_DATA_ROW; i <= lastDataRow; i++) {
+                    const row = unitsSheet.getRow(i);
+                    styleUnitRow(row);
+                    if ((i - XLSX_FIRST_DATA_ROW) % 2 === 1) {
+                        for (let c = 1; c <= 7; c++) row.getCell(c).fill = altFill;
+                    }
+                    row.getCell(6).dataValidation = {
+                        type: 'list',
+                        allowBlank: true,
+                        formulae: ['"Yes,No"'],
+                        showErrorMessage: true,
+                        errorTitle: 'Invalid Value',
+                        error: 'Choose "Yes" or "No".'
+                    };
+                }
+
+                const exampleUnits = [
+                    ['WIRE-001', 'Meter', 1, 8.00, 7.00, 'Yes', 1],
+                    ['WIRE-001', 'Feet', 0.3048, 2.50, 2.20, 'No', 2],
+                    ['WIRE-001', 'Roll', 100, 700.00, 650.00, 'No', 3],
+                ];
+                exampleUnits.forEach((values, idx) => {
+                    const row = unitsSheet.getRow(XLSX_FIRST_DATA_ROW + idx);
+                    values.forEach((v, c) => { row.getCell(c + 1).value = v; });
+                    applyExampleStyle(row, 7);
+                });
+
+                // Instructions sheet
+                const instructionsSheet = workbook.addWorksheet('Instructions');
+                instructionsSheet.getColumn('A').width = 100;
+                const instructions = [
+                    'COMPLETE PRODUCT IMPORT TEMPLATE - INSTRUCTIONS',
+                    '',
+                    'This workbook contains two worksheets:',
+                    '1. Products - Main product information (10 columns)',
+                    '2. Product Units - Selling units for Multiple UOM products (7 columns)',
+                    '',
+                    'Rows 1-5 are the store header and row 6 holds the column headers. Enter data from row 7.',
+                    'The header rows are skipped automatically on import.',
+                    '',
+                    '=== PRODUCTS WORKSHEET ===',
+                    'Columns:',
+                    'A: SKU / Barcode - Unique identifier (REQUIRED)',
+                    'B: Product Name - Product display name (REQUIRED)',
+                    'C: Category Name - Must match existing category or will be created (REQUIRED)',
+                    'D: Retail Price - For Multiple UOM: default unit price for reference only (may be blank / N/A)',
+                    'E: Wholesale Price - For Multiple UOM: default unit price for reference only (may be blank / N/A)',
+                    'F: Cost Price - Cost per BASE UNIT (REQUIRED for Multiple UOM)',
+                    'G: Stock Quantity - Quantity in BASE UNIT for Multiple UOM products',
+                    'H: Selling Method - "Standard" or "Multiple UOM" (blank = Standard)',
+                    'I: Base Unit - Base inventory unit (e.g., Meter, Piece) - REQUIRED for Multiple UOM',
+                    'J: Default Unit - Default selling unit name - REQUIRED for Multiple UOM',
+                    '',
+                    'Rules:',
+                    '- Standard products: Fill D, E, F, G. H=Standard, I and J = N/A (or blank).',
+                    '- Multiple UOM products: D and E are ignored on import (unit prices come from Product Units). Fill F (cost per base unit), G (stock in base units), H=Multiple UOM, I (base unit), J (default unit name).',
+                    '- The grey italic example rows (CEMENT-001, WIRE-001) are ignored on import. Delete or overwrite them.',
+                    '',
+                    '=== PRODUCT UNITS WORKSHEET ===',
+                    'Columns:',
+                    'A: SKU / Barcode - Must match a product in Products worksheet (REQUIRED)',
+                    'B: Unit Name - Selling unit name, e.g., Roll, Feet, Box (REQUIRED)',
+                    'C: Conversion Factor - How many base units in one selling unit (REQUIRED, >0)',
+                    'D: Retail Price - Selling price for this unit (REQUIRED)',
+                    'E: Wholesale Price - Wholesale price for this unit (REQUIRED)',
+                    'F: Is Default - "Yes" for exactly ONE unit per product, "No" for others (REQUIRED)',
+                    'G: Sort Order - Display order number',
+                    '',
+                    'Rules:',
+                    '- Each Multiple UOM product must have at least one row in Product Units.',
+                    '- Exactly ONE unit per product must have Is Default = Yes.',
+                    '- Unit names must be unique per product.',
+                    '- Conversion Factor must be > 0.',
+                    '',
+                    '=== IMPORT NOTES ===',
+                    '- Import as ONE .xlsx file (both worksheets together).',
+                    '- CSV import only supports Standard products (7 columns).',
+                    '- An Inventory Export file can be edited and imported back directly.',
+                    '- Existing products matched by SKU will be updated (stock NOT overwritten).',
+                    '- Historical transactions are preserved - unit snapshots remain unchanged.',
+                ];
+                instructions.forEach((line, i) => {
+                    const cell = instructionsSheet.getRow(i + 1).getCell(1);
+                    cell.value = line;
+                    if (i === 0) cell.font = { bold: true, size: 12, color: { argb: '1B3A69' } };
+                    else if (line.startsWith('===')) cell.font = { bold: true, size: 11, color: { argb: '374151' } };
+                    else if (line.startsWith('-')) cell.font = { size: 10 };
+                });
+            }
 
             const buffer = await workbook.xlsx.writeBuffer();
             const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
             const safeStorePrefix = (settings?.store_name || 'POS').replace(/[^a-zA-Z0-9_-]/g, '_');
-            saveAs(blob, `${safeStorePrefix}_Products_Template.xlsx`);
+            const fileName = isComplete
+                ? `${safeStorePrefix}_Complete_Products_Template.xlsx`
+                : `${safeStorePrefix}_Standard_Products_Template.xlsx`;
+            saveAs(blob, fileName);
             Swal.fire({ icon: 'success', title: 'Template Downloaded!', toast: true, position: 'top-end', showConfirmButton: false, timer: 1500 });
         } catch (e) {
             console.error(e);
+            Swal.fire('Error', 'Failed to download template.', 'error');
         }
     };
 
     const exportExcel = async () => {
         try {
             const workbook = new ExcelJS.Workbook();
-            const worksheet = workbook.addWorksheet('Inventory Report', {
-                views: [{ showGridLines: true }]
+            const altFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'F8FAFC' } };
+            const generatedAt = new Date().toLocaleString();
+            const isMultiProduct = (p) => p.selling_method === 'multiple' || p.is_multi_unit;
+            const centsToAmount = (v) => (v === null || v === undefined || v === '') ? 0 : Number(v) / 100;
+
+            // ============================================================
+            // WORKSHEET 1: Products
+            // ============================================================
+            const productsSheet = workbook.addWorksheet('Products', {
+                views: [{ showGridLines: true, state: 'frozen', ySplit: XLSX_HEADER_ROW }]
             });
+            [22, 35, 25, 18, 18, 18, 16, 18, 15, 18].forEach((w, i) => { productsSheet.getColumn(i + 1).width = w; });
 
-            // Set column widths
-            worksheet.getColumn('A').width = 20; // Barcode/SKU
-            worksheet.getColumn('B').width = 30; // Product Name
-            worksheet.getColumn('C').width = 25; // Category Name
-            worksheet.getColumn('D').width = 18; // Retail Price
-            worksheet.getColumn('E').width = 18; // Wholesale Price
-            worksheet.getColumn('F').width = 18; // Cost Price
-            worksheet.getColumn('G').width = 15; // Stock Quantity
+            writeStoreHeader(productsSheet, 'J', `INVENTORY EXPORT (Generated: ${generatedAt})`);
+            writeColumnHeaders(productsSheet, PRODUCT_COLUMN_HEADERS, PRODUCT_NUMERIC_COLS);
 
-            // Add Store Header (Rows 1 to 4)
-            const storeName = settings?.store_name || 'POS Store';
-            const storeAddress = settings?.address || '';
-            const storeContact = settings?.phone ? `Contact: ${settings.phone}` : '';
-
-            // Store Name
-            worksheet.mergeCells('A1:G1');
-            worksheet.getCell('A1').value = storeName.toUpperCase();
-            worksheet.getCell('A1').font = { bold: true, color: { argb: '1B3A69' }, size: 16 };
-            worksheet.getCell('A1').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(1).height = 28;
-
-            // Address
-            worksheet.mergeCells('A2:G2');
-            worksheet.getCell('A2').value = storeAddress;
-            worksheet.getCell('A2').font = { color: { argb: '555555' }, size: 9 };
-            worksheet.getCell('A2').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(2).height = 16;
-
-            // Contact
-            worksheet.mergeCells('A3:G3');
-            worksheet.getCell('A3').value = storeContact;
-            worksheet.getCell('A3').font = { color: { argb: '555555' }, size: 9, italic: true };
-            worksheet.getCell('A3').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(3).height = 16;
-
-            // Title
-            worksheet.mergeCells('A4:G4');
-            worksheet.getCell('A4').value = `INVENTORY STATUS & BACKUP REPORT (Generated: ${new Date().toLocaleString()})`;
-            worksheet.getCell('A4').font = { bold: true, color: { argb: '333333' }, size: 11 };
-            worksheet.getCell('A4').alignment = { vertical: 'middle', horizontal: 'center' };
-            worksheet.getRow(4).height = 20;
-
-            // Empty spacing row
-            worksheet.getRow(5).height = 10;
-
-            // Headers on Row 6
-            const headers = ['SKU / Barcode', 'Product Name', 'Category Name', 'Retail Price', 'Wholesale Price', 'Cost Price', 'Stock Quantity'];
-            headers.forEach((h, colIndex) => {
-                const cell = worksheet.getRow(6).getCell(colIndex + 1);
-                cell.value = h;
-                cell.font = { bold: true, color: { argb: 'FFFFFF' }, size: 10 };
-                cell.fill = {
-                    type: 'pattern',
-                    pattern: 'solid',
-                    fgColor: { argb: '1B3A69' } // Sleek navy theme for reports
-                };
-                cell.alignment = { vertical: 'middle', horizontal: colIndex >= 3 ? 'right' : 'left' };
-            });
-            worksheet.getRow(6).height = 25;
-
-            // Enable worksheet protection to lock header cells (Rows 1 to 6)
-            worksheet.protect('', {
-                selectLockedCells: true,
-                selectUnlockedCells: true
-            });
-
-            // Add product rows starting from Row 7
             products.forEach((p, idx) => {
-                const rowIndex = idx + 7;
-                const row = worksheet.getRow(rowIndex);
+                const row = productsSheet.getRow(XLSX_FIRST_DATA_ROW + idx);
+                const isMulti = isMultiProduct(p);
+                const defaultUnitRow = isMulti ? (p.units?.find(u => u.is_default) || p.units?.[0] || null) : null;
+                const defaultUnit = defaultUnitRow?.name || '';
 
-                row.getCell(1).value = p.sku || 'N/A';
-                row.getCell(2).value = p.name || 'Unknown';
+                row.getCell(1).value = p.sku || '';
+                row.getCell(2).value = p.name || '';
                 row.getCell(3).value = p.category?.name || 'Uncategorized';
-                row.getCell(4).value = p.price / 100;
-                row.getCell(5).value = p.wholesale_price ? p.wholesale_price / 100 : '';
-                row.getCell(6).value = p.cost_price ? p.cost_price / 100 : '';
-                row.getCell(7).value = p.stock_quantity;
+                // Multiple UOM prices live on the Product Units sheet
+                // Multiple UOM: show the default unit's prices (reference only - unit prices are
+                // imported from the Product Units sheet). Standard: the product's own prices.
+                row.getCell(4).value = isMulti ? (defaultUnitRow ? centsToAmount(defaultUnitRow.price) : 'N/A') : centsToAmount(p.price);
+                row.getCell(5).value = isMulti ? (defaultUnitRow ? centsToAmount(defaultUnitRow.wholesale_price) : 'N/A') : centsToAmount(p.wholesale_price);
+                if (isMulti && defaultUnitRow) {
+                    const note = `Price of the default unit (${defaultUnit}). To change it, edit the Product Units sheet.`;
+                    row.getCell(4).note = note;
+                    row.getCell(5).note = note;
+                }
+                row.getCell(6).value = centsToAmount(p.cost_price);
+                row.getCell(7).value = Number(p.stock_quantity) || 0;
+                row.getCell(8).value = isMulti ? 'Multiple UOM' : 'Standard';
+                row.getCell(9).value = isMulti ? (p.base_unit || '') : 'N/A';
+                row.getCell(10).value = isMulti ? defaultUnit : 'N/A';
 
-                // Format cell alignments
-                row.getCell(1).alignment = { horizontal: 'left' };
-                row.getCell(2).alignment = { horizontal: 'left' };
-                row.getCell(3).alignment = { horizontal: 'left' };
-                row.getCell(4).alignment = { horizontal: 'right' };
-                row.getCell(5).alignment = { horizontal: 'right' };
-                row.getCell(6).alignment = { horizontal: 'right' };
-                row.getCell(7).alignment = { horizontal: 'right' };
-
-                // Number formats
-                row.getCell(4).numFmt = '#,##0.00';
-                row.getCell(5).numFmt = '#,##0.00';
-                row.getCell(6).numFmt = '#,##0.00';
-                row.getCell(7).numFmt = '#,##0';
-
-                // Unlock data rows cells for editing
-                row.getCell(1).protection = { locked: false };
-                row.getCell(2).protection = { locked: false };
-                row.getCell(3).protection = { locked: false };
-                row.getCell(4).protection = { locked: false };
-                row.getCell(5).protection = { locked: false };
-                row.getCell(6).protection = { locked: false };
-                row.getCell(7).protection = { locked: false };
+                styleProductRow(row, 10);
+                row.getCell(7).numFmt = stockCellFormat(p, row.getCell(7).value);
+                if (idx % 2 === 1) {
+                    for (let c = 1; c <= 10; c++) row.getCell(c).fill = altFill;
+                }
             });
+
+            productsSheet.autoFilter = {
+                from: { row: XLSX_HEADER_ROW, column: 1 },
+                to: { row: XLSX_HEADER_ROW + products.length, column: 10 }
+            };
+
+            // ============================================================
+            // WORKSHEET 2: Product Units
+            // ============================================================
+            const unitsSheet = workbook.addWorksheet('Product Units', {
+                views: [{ showGridLines: true, state: 'frozen', ySplit: XLSX_HEADER_ROW }]
+            });
+            [22, 25, 20, 18, 18, 12, 12].forEach((w, i) => { unitsSheet.getColumn(i + 1).width = w; });
+
+            writeStoreHeader(unitsSheet, 'G', `PRODUCT UNITS EXPORT (Generated: ${generatedAt})`);
+            writeColumnHeaders(unitsSheet, UNIT_COLUMN_HEADERS, UNIT_NUMERIC_COLS);
+
+            const allUnits = [];
+            products.forEach(p => {
+                if (isMultiProduct(p) && p.units && p.units.length > 0) {
+                    p.units.forEach((u, sortIndex) => {
+                        allUnits.push({
+                            sku: p.sku || '',
+                            unit_name: u.name,
+                            conversion_factor: Number(u.conversion_factor),
+                            retail_price: centsToAmount(u.price),
+                            wholesale_price: centsToAmount(u.wholesale_price),
+                            is_default: u.is_default ? 'Yes' : 'No',
+                            sort_order: u.sort_order ?? sortIndex + 1
+                        });
+                    });
+                }
+            });
+
+            allUnits.sort((a, b) => (a.sku !== b.sku ? a.sku.localeCompare(b.sku) : a.sort_order - b.sort_order));
+
+            allUnits.forEach((u, idx) => {
+                const row = unitsSheet.getRow(XLSX_FIRST_DATA_ROW + idx);
+                row.getCell(1).value = u.sku;
+                row.getCell(2).value = u.unit_name;
+                row.getCell(3).value = u.conversion_factor;
+                row.getCell(4).value = u.retail_price;
+                row.getCell(5).value = u.wholesale_price;
+                row.getCell(6).value = u.is_default;
+                row.getCell(7).value = u.sort_order;
+
+                styleUnitRow(row);
+                row.getCell(3).numFmt = quantityFormat(u.conversion_factor);
+                if (idx % 2 === 1) {
+                    for (let c = 1; c <= 7; c++) row.getCell(c).fill = altFill;
+                }
+            });
+
+            unitsSheet.autoFilter = {
+                from: { row: XLSX_HEADER_ROW, column: 1 },
+                to: { row: XLSX_HEADER_ROW + allUnits.length, column: 7 }
+            };
 
             const buffer = await workbook.xlsx.writeBuffer();
             const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
             const dateStr = new Date().toISOString().split('T')[0];
             const safeStorePrefix = (settings?.store_name || 'POS').replace(/[^a-zA-Z0-9_-]/g, '_');
-            saveAs(blob, `${safeStorePrefix}_Inventory_Backup_${dateStr}.xlsx`);
+            saveAs(blob, `${safeStorePrefix}_Inventory_Export_${dateStr}.xlsx`);
+            auditExport({ type: 'inventory_excel', count: products.length, units_count: allUnits.length, file_name: `${safeStorePrefix}_Inventory_Export_${dateStr}.xlsx` });
             Swal.fire({ icon: 'success', title: 'Export Completed!', toast: true, position: 'top-end', showConfirmButton: false, timer: 1500 });
         } catch (e) {
+            console.error(e);
             Swal.fire('Error', 'Failed to export inventory data.', 'error');
         }
-    };
-
-    const parseNumber = (val) => {
-        if (val === null || val === undefined) return 0;
-        if (typeof val === 'number') return val;
-        let s = String(val).trim();
-        if (s === '') return 0;
-        // Normalize thousand separators and decimal separators
-        // If both comma and dot present, assume comma is thousand separator
-        if (s.indexOf(',') > -1 && s.indexOf('.') > -1) {
-            s = s.replace(/,/g, '');
-        } else if (s.indexOf(',') > -1 && s.indexOf('.') === -1) {
-            // comma as decimal separator
-            s = s.replace(/,/g, '.');
-        }
-        s = s.replace(/\s/g, '');
-        const n = parseFloat(s);
-        return Number.isFinite(n) ? n : 0;
-    };
-
-    const parseCSV = (text) => {
-        const lines = text.split(/\r?\n/);
-        const result = [];
-        for (let i = 1; i < lines.length; i++) {
-            if (!lines[i].trim()) continue;
-            const row = lines[i].split(/,(?=(?:(?:[^"]*"){2})*[^"]*$)/);
-            const clean = (val) => val ? val.replace(/^["']|["']$/g, '').trim() : '';
-            const sku = clean(row[0]);
-            const name = clean(row[1]);
-            const category_name = clean(row[2]);
-            const price = parseNumber(clean(row[3]));
-            const wholesale_price = parseNumber(clean(row[4]));
-            const cost_price = parseNumber(clean(row[5]));
-            const stock_quantity = parseInt(clean(row[6]), 10) || 0;
-
-            if (sku && name) {
-                result.push({
-                    sku, name, category_name, price, wholesale_price, cost_price, stock_quantity
-                });
-            }
-        }
-        return result;
     };
 
     const handleImport = async (e) => {
@@ -1818,7 +2140,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
 
         Swal.fire({
             title: 'Processing File...',
-            text: 'Please wait while we validate and import your product list.',
+            text: 'Please wait while we analyze your file.',
             allowOutsideClick: false,
             didOpen: () => { Swal.showLoading(); }
         });
@@ -1829,205 +2151,247 @@ export default function Inventory({ auth, initial_products, initial_categories, 
 
             reader.onload = async (evt) => {
                 try {
-                    let importedProducts = [];
+                    let previewData = {
+                        products: [],
+                        units: [],
+                        summary: {
+                            totalProducts: 0,
+                            newProducts: 0,
+                            existingProducts: 0,
+                            standardProducts: 0,
+                            multipleUomProducts: 0,
+                            totalUnits: 0,
+                            duplicateSkus: 0
+                        },
+                        errors: [],
+                        warnings: [],
+                        fileName: file.name
+                    };
+
+                    const addProductRow = (rowNum, values) => {
+                        const sku = String(values.sku ?? '').trim();
+                        const name = String(values.name ?? '').trim();
+                        const category_name = String(values.category_name ?? '').trim();
+                        if (!sku && !name && !category_name) return;
+
+                        const method = String(values.selling_method ?? '').trim().toLowerCase();
+                        const isMulti = method === 'multiple uom' || method === 'multiple';
+                        const existing = products.find(p => p.sku === sku);
+
+                        previewData.products.push({
+                            rowNum,
+                            sku, name, category_name,
+                            price: parseImportNumber(values.price),
+                            wholesale_price: parseImportNumber(values.wholesale_price),
+                            cost_price: parseImportNumber(values.cost_price),
+                            stock_quantity: parseImportNumber(values.stock_quantity),
+                            // Blank stock never changes an existing product's stock
+                            stock_provided: parseImportNumber(values.stock_quantity) !== null,
+                            selling_method_raw: method,
+                            selling_method: isMulti ? 'multiple' : 'standard',
+                            base_unit: isMulti ? notApplicableToBlank(values.base_unit) : '',
+                            default_unit: isMulti ? notApplicableToBlank(values.default_unit) : '',
+                            isNew: !existing,
+                            existingProduct: existing
+                        });
+                        previewData.summary.totalProducts++;
+                        if (isMulti) previewData.summary.multipleUomProducts++;
+                        else previewData.summary.standardProducts++;
+                        if (existing) previewData.summary.existingProducts++;
+                        else previewData.summary.newProducts++;
+                    };
 
                     if (isCsv) {
-                        const csvContent = new TextDecoder('utf-8').decode(evt.target.result);
-                        importedProducts = parseCSV(csvContent);
+                        // CSV - Standard products only. First line is the header row
+                        // (template/old exports); columns are matched by name, else by position.
+                        const csvContent = new TextDecoder('utf-8').decode(evt.target.result).replace(/^﻿/, '');
+                        const lines = csvContent.split(/\r?\n/);
+
+                        if (lines.length < 2) {
+                            Swal.fire('No Data', 'CSV file is empty.', 'warning');
+                            return;
+                        }
+
+                        const columns = { ...PRODUCT_DEFAULT_COLUMNS };
+                        const seen = new Set();
+                        splitCsvLine(lines[0]).forEach((h, i) => {
+                            const field = matchHeader(PRODUCT_HEADER_RULES, h);
+                            if (field && !seen.has(field)) {
+                                seen.add(field);
+                                columns[field] = i + 1;
+                            }
+                        });
+
+                        for (let i = 1; i < lines.length; i++) {
+                            if (!lines[i].trim()) continue;
+                            const cells = splitCsvLine(lines[i]);
+                            const get = (field) => cells[columns[field] - 1] ?? '';
+                            if (TEMPLATE_EXAMPLE_SKUS.has(get('sku')) && get('name').startsWith('Sample Product')) continue;
+                            addProductRow(i + 1, {
+                                sku: get('sku'), name: get('name'), category_name: get('category_name'),
+                                price: get('price'), wholesale_price: get('wholesale_price'),
+                                cost_price: get('cost_price'), stock_quantity: get('stock_quantity'),
+                                selling_method: '', // CSV supports Standard only
+                            });
+                        }
                     } else {
+                        // XLSX - supports both Standard and Multiple UOM
                         const workbook = new ExcelJS.Workbook();
                         await workbook.xlsx.load(evt.target.result);
-                        const worksheet = workbook.worksheets[0];
-                        let headerRowNumber = 1;
-                        worksheet.eachRow((row, rowNumber) => {
-                            const valA = row.getCell(1).value?.toString() || '';
-                            const valB = row.getCell(2).value?.toString() || '';
-                            if (valA.includes('Barcode/SKU') || valB.includes('Product Name')) {
-                                headerRowNumber = rowNumber;
-                            }
+
+                        // Products sheet (old files used "Products Template" / "Inventory Report" as first sheet)
+                        const productsSheet = workbook.getWorksheet('Products') || workbook.worksheets.find(ws => ws.state !== 'hidden') || workbook.worksheets[0];
+                        const productHeader = locateXlsxHeader(productsSheet, /product|name/, PRODUCT_HEADER_RULES, PRODUCT_DEFAULT_COLUMNS);
+                        const pc = productHeader.columns;
+
+                        productsSheet.eachRow((row, rowNumber) => {
+                            if (rowNumber <= productHeader.headerRow) return;
+                            const text = (field) => xlsxCellText(row.getCell(pc[field])).trim();
+                            const sku = text('sku');
+                            if (isTemplateExampleRow(row, pc.sku, sku)) return;
+
+                            addProductRow(rowNumber, {
+                                sku,
+                                name: text('name'),
+                                category_name: text('category_name'),
+                                price: row.getCell(pc.price).value,
+                                wholesale_price: row.getCell(pc.wholesale_price).value,
+                                cost_price: row.getCell(pc.cost_price).value,
+                                stock_quantity: row.getCell(pc.stock_quantity).value,
+                                selling_method: text('selling_method'),
+                                base_unit: text('base_unit'),
+                                default_unit: text('default_unit'),
+                            });
                         });
 
-                        worksheet.eachRow((row, rowNumber) => {
-                            if (rowNumber <= headerRowNumber) return;
+                        // Product Units sheet (optional)
+                        const unitsSheet = workbook.getWorksheet('Product Units');
+                        if (unitsSheet) {
+                            const unitHeader = locateXlsxHeader(unitsSheet, /unit|name/, UNIT_HEADER_RULES, UNIT_DEFAULT_COLUMNS);
+                            const uc = unitHeader.columns;
 
-                            const getCellString = (colNum) => {
-                                const val = row.getCell(colNum).value;
-                                if (val && typeof val === 'object' && val.text) return val.text;
-                                return val?.toString() || '';
-                            };
+                            unitsSheet.eachRow((row, rowNumber) => {
+                                if (rowNumber <= unitHeader.headerRow) return;
+                                const text = (field) => xlsxCellText(row.getCell(uc[field])).trim();
+                                const sku = text('sku');
+                                const unit_name = text('unit_name');
+                                if (!sku && !unit_name) return;
+                                if (isTemplateExampleRow(row, uc.sku, sku)) return;
 
-                            const sku = getCellString(1);
-                            const name = getCellString(2);
-                            const category_name = getCellString(3);
-                            const parseNumberCell = (val) => {
-                                if (val === null || val === undefined) return 0;
-                                if (typeof val === 'number') return val;
-                                // ExcelJS may give objects for rich text; convert to string first
-                                const s = (typeof val === 'object' && val.text) ? val.text : String(val);
-                                return parseNumber(s);
-                            };
-
-                            const price = parseNumberCell(row.getCell(4).value) || 0;
-                            const wholesale_price = parseNumberCell(row.getCell(5).value);
-                            const cost_price = parseNumberCell(row.getCell(6).value);
-                            const stock_quantity = parseInt(row.getCell(7).value, 10) || 0;
-
-                            // Add to list if any product identifier is present (backend will validate completeness)
-                            if (sku || name || category_name) {
-                                importedProducts.push({
+                                previewData.units.push({
                                     rowNum: rowNumber,
-                                    sku: sku.trim(),
-                                    name: name.trim(),
-                                    category_name: category_name.trim(),
-                                    price: price,
-                                    wholesale_price: wholesale_price,
-                                    cost_price: cost_price,
-                                    stock_quantity: stock_quantity
+                                    sku, unit_name,
+                                    conversion_factor: parseImportNumber(row.getCell(uc.conversion_factor).value),
+                                    retail_price: parseImportNumber(row.getCell(uc.retail_price).value),
+                                    wholesale_price: parseImportNumber(row.getCell(uc.wholesale_price).value),
+                                    is_default: text('is_default').toLowerCase(),
+                                    sort_order: parseImportNumber(row.getCell(uc.sort_order).value)
                                 });
-                            }
-                        });
+                                previewData.summary.totalUnits++;
+                            });
+                        }
                     }
 
-                    if (importedProducts.length === 0) {
-                        Swal.fire('No Data Found', 'Make sure your file has data below the headers and matches the template structure.', 'warning');
+                    // Calculate duplicates
+                    const skuCounts = {};
+                    previewData.products.forEach(p => {
+                        skuCounts[p.sku] = (skuCounts[p.sku] || 0) + 1;
+                    });
+                    previewData.summary.duplicateSkus = Object.values(skuCounts).filter(c => c > 1).length;
+
+                    // Check for units referencing unknown SKUs
+                    const productSkus = new Set(previewData.products.map(p => p.sku));
+                    previewData.units.forEach(u => {
+                        if (!productSkus.has(u.sku)) {
+                            previewData.errors.push(`Row ${u.rowNum} (Product Units): SKU "${u.sku}" not found in Products sheet`);
+                        }
+                    });
+
+                    // Validate each product
+                    previewData.products.forEach(p => {
+                        if (!p.sku) previewData.errors.push(`Row ${p.rowNum}: SKU is empty`);
+                        if (!p.name) previewData.errors.push(`Row ${p.rowNum}: Product Name is empty`);
+                        if (!p.category_name) previewData.errors.push(`Row ${p.rowNum}: Category Name is empty`);
+                        
+                        if (p.selling_method === 'multiple') {
+                            if (!p.base_unit) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Base Unit required for Multiple UOM`);
+                            if (!p.default_unit) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Default Unit required for Multiple UOM`);
+                            if (p.cost_price === null || p.cost_price < 0) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Cost Price required for Multiple UOM`);
+                            if (p.stock_quantity === null || p.stock_quantity < 0) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Stock Quantity required for Multiple UOM`);
+                            
+                            // Check units
+                            const productUnits = previewData.units.filter(u => u.sku === p.sku);
+                            if (productUnits.length === 0) {
+                                previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Multiple UOM product must have units in Product Units sheet`);
+                            } else {
+                                let hasDefault = false;
+                                const unitNames = new Set();
+                                productUnits.forEach(u => {
+                                    if (!u.unit_name) previewData.errors.push(`Row ${u.rowNum} (Product Units, ${p.sku}): Unit name is empty`);
+                                    if (unitNames.has(u.unit_name.toLowerCase())) {
+                                        previewData.errors.push(`Row ${u.rowNum} (Product Units, ${p.sku}): Duplicate unit name "${u.unit_name}"`);
+                                    }
+                                    unitNames.add(u.unit_name.toLowerCase());
+                                    if (u.conversion_factor === null || u.conversion_factor <= 0) {
+                                        previewData.errors.push(`Row ${u.rowNum} (Product Units, ${p.sku}): Conversion factor must be > 0 for "${u.unit_name}"`);
+                                    } else {
+                                        const hint = repeatingFactorHint(u.conversion_factor, p.base_unit, u.unit_name);
+                                        if (hint) previewData.warnings.push(`Row ${u.rowNum} (Product Units, ${p.sku}, ${u.unit_name}): ${hint}`);
+                                    }
+                                    if (u.retail_price === null || u.retail_price < 0) {
+                                        previewData.errors.push(`Row ${u.rowNum} (Product Units, ${p.sku}): Retail price required for "${u.unit_name}"`);
+                                    }
+                                    if (u.wholesale_price === null || u.wholesale_price < 0) {
+                                        previewData.errors.push(`Row ${u.rowNum} (Product Units, ${p.sku}): Wholesale price required for "${u.unit_name}"`);
+                                    }
+                                    if (u.is_default === 'yes') {
+                                        if (hasDefault) {
+                                            previewData.errors.push(`Row ${u.rowNum} (Product Units, ${p.sku}): Multiple default units`);
+                                        }
+                                        hasDefault = true;
+                                    }
+                                });
+                                if (!hasDefault) {
+                                    previewData.errors.push(`Product ${p.sku}: Must have exactly one default unit (Is Default = Yes)`);
+                                }
+                            }
+                        } else {
+                            // Standard product. Blank Selling Method = Standard (old 7-column files);
+                            // blank wholesale/cost/stock default to 0 like before.
+                            if (!['', 'standard'].includes(p.selling_method_raw)) {
+                                previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Selling Method must be "Standard" or "Multiple UOM"`);
+                            }
+                            p.wholesale_price = p.wholesale_price ?? 0;
+                            p.cost_price = p.cost_price ?? 0;
+                            p.stock_quantity = p.stock_quantity ?? 0;
+                            if (p.price === null || p.price < 0) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Retail Price required`);
+                            if (p.wholesale_price < 0) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Wholesale Price cannot be negative`);
+                            if (p.cost_price < 0) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Cost Price cannot be negative`);
+                            if (p.stock_quantity < 0) previewData.errors.push(`Row ${p.rowNum} (${p.sku}): Stock Quantity cannot be negative`);
+                        }
+                    });
+
+                    if (previewData.products.length === 0) {
+                        Swal.fire('No Data', 'No valid products found in file.', 'warning');
                         return;
                     }
 
-                    // Deduplicate by SKU (last occurrence wins) to avoid multiple updates for same product
-                    const dedupeResult = (() => {
-                        const map = new Map();
-                        let duplicateCount = 0;
-                        importedProducts.forEach((p) => {
-                            const key = (p.sku || '').trim();
-                            if (!key) return; // ignore rows without SKU
-                            if (map.has(key)) duplicateCount++;
-                            map.set(key, p);
-                        });
-                        return { unique: Array.from(map.values()), duplicateCount };
-                    })();
-
-                    const uniqueProducts = dedupeResult.unique;
-                    const duplicateCount = dedupeResult.duplicateCount;
-
-                    // Close parsing loader to show option dialog
+                    // Show the React preview modal; submitImport() sends it
                     Swal.close();
-
-                    const choice = await Swal.fire({
-                        title: 'Select Import Method',
-                        html: `
-                            <div class="text-left font-sans text-sm p-1">
-                                <p class="text-gray-600 mb-4">We found <strong>${importedProducts.length}</strong> rows in your file (${uniqueProducts.length} unique SKUs, ${duplicateCount} duplicate rows). How would you like to handle duplicates?</p>
-                                
-                                <div class="p-3 bg-blue-50 border border-blue-100 rounded-lg mb-3">
-                                    <h4 class="font-bold text-blue-900 text-xs uppercase tracking-wide">Option A: Overwrite Duplicates</h4>
-                                    <p class="text-[11px] text-blue-700 mt-1 leading-relaxed">Updates existing product details (Name, Price, Cost, Category, Stock Level) with the new values from your file.</p>
-                                </div>
-                                
-                                <div class="p-3 bg-amber-50 border border-amber-100 rounded-lg">
-                                    <h4 class="font-bold text-amber-900 text-xs uppercase tracking-wide">Option B: Skip Duplicates</h4>
-                                    <p class="text-[11px] text-amber-700 mt-1 leading-relaxed">Only imports brand new products. Leaves all existing products in your inventory untouched.</p>
-                                </div>
-                            </div>
-                        `,
-                        showDenyButton: true,
-                        showCancelButton: true,
-                        confirmButtonText: 'Overwrite Duplicates',
-                        denyButtonText: 'Skip Duplicates',
-                        cancelButtonText: 'Cancel',
-                        confirmButtonColor: '#2563eb', // blue
-                        denyButtonColor: '#d97706',    // amber
-                        cancelButtonColor: '#6b7280',  // gray
-                        customClass: {
-                            popup: 'rounded-none'
-                        }
-                    });
-
-                    if (choice.isDismissed) {
-                        return; // Stop if they clicked cancel
-                    }
-
-                    const overwrite = choice.isConfirmed; // true if Overwrite, false if Skip (isDenied)
-
-                    // Re-open loader for the backend processing
-                    Swal.fire({
-                        title: 'Processing File...',
-                        text: 'Please wait while we validate and import your product list.',
-                        allowOutsideClick: false,
-                        didOpen: () => { Swal.showLoading(); }
-                    });
-
-                    // Re-open loader for the backend processing
-                    Swal.fire({
-                        title: 'Processing File...',
-                        text: 'Please wait while we validate and import your product list.',
-                        allowOutsideClick: false,
-                        didOpen: () => { Swal.showLoading(); }
-                    });
-
-                    const response = await axios.post('/api/products/import', { 
-                        // Send deduplicated rows to backend to avoid repeated updates on same SKU
-                        products: uniqueProducts, 
-                        overwrite: overwrite 
-                    });
-                    if (response.data.success) {
-                        const { imported_count, skipped_count, skipped_skus, updated_count = 0 } = response.data;
-                        
-                        let htmlContent = `<div class="text-left font-sans text-sm p-1">`;
-                        if (imported_count > 0) {
-                            htmlContent += `<p class="font-bold text-gray-800">Successfully imported <span class="text-green-600 font-semibold">${imported_count}</span> new products.</p>`;
-                        }
-                        if (updated_count > 0) {
-                            htmlContent += `<p class="font-bold text-gray-800 ${imported_count > 0 ? 'mt-2' : ''}">Successfully updated/overwritten <span class="text-blue-600 font-semibold">${updated_count}</span> existing products.</p>`;
-                        }
-                        if (skipped_count > 0) {
-                            htmlContent += `
-                                <p class="mt-3 text-amber-700 font-semibold">Skipped <span class="font-bold">${skipped_count}</span> duplicate products (Barcode/SKU already exists in database):</p>
-                                <div class="mt-2 max-h-32 overflow-y-auto bg-amber-50 p-2 rounded border border-amber-200 font-mono text-xs text-amber-800 select-all">
-                                    ${skipped_skus.join('<br>')}
-                                </div>
-                            `;
-                        }
-                        htmlContent += `</div>`;
-
-                        Swal.fire({
-                            icon: 'success',
-                            title: 'Import Processed!',
-                            html: htmlContent,
-                            confirmButtonColor: '#1B3A69'
-                        });
-                        loadAllProducts(false);
-                    } else {
-                        throw new Error(response.data.message);
-                    }
+                    setImportPreview({ ...previewData, overwrite: true, updateStock: false, submitting: false, serverErrors: [] });
                 } catch (err) {
+                    // File could not be parsed (corrupt / not a valid .xlsx or .csv)
                     console.error(err);
-                    let errMsg = err.message || 'An error occurred during import. Check file formatting.';
-                    
-                    // Format structural validation errors returned by Laravel
-                    if (err.response?.data?.errors && Array.isArray(err.response.data.errors)) {
-                        errMsg = err.response.data.errors.slice(0, 10).join('\n');
-                        if (err.response.data.errors.length > 10) {
-                            errMsg += `\n...and ${err.response.data.errors.length - 10} more errors.`;
-                        }
-                    } else if (err.response?.data?.message) {
-                        errMsg = err.response.data.message;
-                    }
-
                     Swal.fire({
                         icon: 'error',
-                        title: 'Import Failed',
-                        text: errMsg,
-                        customClass: {
-                        }
+                        title: 'Could Not Read File',
+                        text: err.message || 'The file could not be read. Make sure it is a valid .xlsx or .csv file.',
+                        customClass: { popup: 'rounded-none' }
                     });
                 }
             };
 
-            if (isCsv) {
-                reader.readAsArrayBuffer(file);
-            } else {
-                reader.readAsArrayBuffer(file);
-            }
+            reader.readAsArrayBuffer(file);
         } catch (err) {
             Swal.fire('Error', 'Could not read the uploaded file.', 'error');
         } finally {
@@ -2035,8 +2399,182 @@ export default function Inventory({ auth, initial_products, initial_categories, 
         }
     };
 
+    const submitImport = async () => {
+        if (!importPreview || importPreview.submitting || importPreview.errors.length > 0) return;
+        const { products: rows, units, overwrite, updateStock } = importPreview;
+        setImportPreview(prev => ({ ...prev, submitting: true, serverErrors: [] }));
+
+        try {
+            // Duplicate SKUs: last occurrence wins
+            const uniqueProducts = Array.from(rows.reduce((map, p) => map.set(p.sku, p), new Map()).values())
+                .map(({ existingProduct, isNew, selling_method_raw, stock_provided, ...row }) => ({
+                    ...row,
+                    // Multiple UOM prices come from the Product Units sheet; D/E are reference only
+                    ...(row.selling_method === 'multiple' ? { price: null, wholesale_price: null } : {}),
+                    stock_quantity: stock_provided ? row.stock_quantity : null,
+                }));
+
+            const response = await axios.post('/api/products/import', {
+                products: uniqueProducts,
+                units,
+                file_name: importPreview.fileName,
+                overwrite,
+                update_stock: overwrite && updateStock,
+            });
+            if (!response.data.success) throw new Error(response.data.message);
+
+            setImportPreview(null);
+            loadAllProducts(false);
+
+            const { imported_count = 0, updated_count = 0, stock_updated_count = 0, skipped_count = 0, skipped_skus = [], warnings = [] } = response.data;
+            let htmlContent = `<div class="text-left font-sans text-sm p-1">`;
+            if (imported_count > 0) {
+                htmlContent += `<p class="font-bold text-gray-800">Imported <span class="text-green-600 font-semibold">${imported_count}</span> new product(s).</p>`;
+            }
+            if (updated_count > 0) {
+                htmlContent += `<p class="font-bold text-gray-800 mt-2">Updated <span class="text-blue-600 font-semibold">${updated_count}</span> existing product(s)${stock_updated_count > 0 ? `, stock changed on <span class="text-amber-600 font-semibold">${stock_updated_count}</span>` : ''}.</p>`;
+            }
+            if (skipped_count > 0) {
+                htmlContent += `
+                    <p class="mt-3 text-amber-700 font-semibold">Skipped <span class="font-bold">${skipped_count}</span> existing product(s):</p>
+                    <div class="mt-2 max-h-32 overflow-y-auto bg-amber-50 p-2 border border-amber-200 font-mono text-xs text-amber-800 select-all">${skipped_skus.join('<br>')}</div>`;
+            }
+            if (warnings.length > 0) {
+                htmlContent += `
+                    <p class="mt-3 text-indigo-700 font-semibold">Warnings:</p>
+                    <div class="mt-2 max-h-32 overflow-y-auto bg-indigo-50 p-2 border border-indigo-200 font-mono text-xs text-indigo-800 select-all">${warnings.join('<br>')}</div>`;
+            }
+            htmlContent += `</div>`;
+            Swal.fire({ icon: 'success', title: 'Import Completed!', html: htmlContent, confirmButtonColor: '#1B3A69' });
+        } catch (err) {
+            console.error(err);
+            const data = err.response?.data;
+            const serverErrors = Array.isArray(data?.errors) && data.errors.length
+                ? data.errors
+                : [data?.message || err.message || 'An error occurred during import.'];
+            setImportPreview(prev => prev && ({ ...prev, submitting: false, serverErrors }));
+        }
+    };
+
     const handleChange = (e) => setFormData({ ...formData, [e.target.name]: e.target.value });
     const handleFileChange = (e) => setFormData({ ...formData, image: e.target.files[0] });
+
+    const handleSellingMethodChange = (method) => {
+        setFormData((prev) => ({
+            ...prev,
+            selling_method: method,
+            units: method === 'multiple' && prev.units.length === 0
+                ? [emptyUnitRow(true)]
+                : prev.units,
+        }));
+    };
+
+    const handleUnitChange = (index, field, value) => {
+        setFormData((prev) => {
+            const units = [...prev.units];
+            units[index] = { ...units[index], [field]: value };
+
+            if (field === 'is_default' && value) {
+                units.forEach((unit, unitIndex) => {
+                    units[unitIndex] = { ...unit, is_default: unitIndex === index };
+                });
+            }
+
+            return { ...prev, units };
+        });
+    };
+
+    const addUnitRow = () => {
+        setFormData((prev) => ({
+            ...prev,
+            units: [...prev.units, emptyUnitRow(prev.units.length === 0)],
+        }));
+    };
+
+    const removeUnitRow = (index) => {
+        setFormData((prev) => {
+            const units = prev.units.filter((_, unitIndex) => unitIndex !== index);
+
+            if (units.length > 0 && !units.some((unit) => unit.is_default)) {
+                units[0] = { ...units[0], is_default: true };
+            }
+
+            return { ...prev, units };
+        });
+    };
+
+    // Base Unit Suggestion Handlers
+    const filteredBaseUnits = COMMON_UNITS.filter(u =>
+        !formData.base_unit.trim() || u.toLowerCase().includes(formData.base_unit.toLowerCase().trim())
+    );
+
+    const handleBaseUnitKeyDown = (e) => {
+        if (!baseUnitSuggestionsOpen || filteredBaseUnits.length === 0) {
+            if (e.key === 'ArrowDown') {
+                setBaseUnitSuggestionsOpen(true);
+                setBaseUnitHighlightedIndex(0);
+                e.preventDefault();
+            }
+            return;
+        }
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setBaseUnitHighlightedIndex(prev => prev < filteredBaseUnits.length - 1 ? prev + 1 : 0);
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setBaseUnitHighlightedIndex(prev => prev > 0 ? prev - 1 : filteredBaseUnits.length - 1);
+        } else if (e.key === 'Enter') {
+            if (baseUnitHighlightedIndex >= 0 && baseUnitHighlightedIndex < filteredBaseUnits.length) {
+                e.preventDefault();
+                setFormData(prev => ({ ...prev, base_unit: filteredBaseUnits[baseUnitHighlightedIndex] }));
+                setBaseUnitSuggestionsOpen(false);
+                setBaseUnitHighlightedIndex(-1);
+            }
+        } else if (e.key === 'Escape') {
+            setBaseUnitSuggestionsOpen(false);
+            setBaseUnitHighlightedIndex(-1);
+            e.preventDefault();
+        }
+    };
+
+    // Selling Unit Name Suggestion Handlers
+    const getFilteredUnitNames = (unitName) => COMMON_UNITS.filter(u =>
+        !unitName.trim() || u.toLowerCase().includes(unitName.toLowerCase().trim())
+    );
+
+    const handleUnitNameKeyDown = (index, e) => {
+        const unitName = formData.units[index]?.name || '';
+        const filtered = getFilteredUnitNames(unitName);
+        const openKey = `open_${index}`;
+        const highlightKey = `highlight_${index}`;
+
+        if (!unitNameSuggestionsOpen[openKey] || filtered.length === 0) {
+            if (e.key === 'ArrowDown') {
+                setUnitNameSuggestionsOpen(prev => ({ ...prev, [openKey]: true }));
+                setUnitNameHighlightedIndex(prev => ({ ...prev, [highlightKey]: 0 }));
+                e.preventDefault();
+            }
+            return;
+        }
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setUnitNameHighlightedIndex(prev => ({ ...prev, [highlightKey]: prev[highlightKey] < filtered.length - 1 ? prev[highlightKey] + 1 : 0 }));
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setUnitNameHighlightedIndex(prev => ({ ...prev, [highlightKey]: prev[highlightKey] > 0 ? prev[highlightKey] - 1 : filtered.length - 1 }));
+        } else if (e.key === 'Enter') {
+            if (unitNameHighlightedIndex[highlightKey] >= 0 && unitNameHighlightedIndex[highlightKey] < filtered.length) {
+                e.preventDefault();
+                handleUnitChange(index, 'name', filtered[unitNameHighlightedIndex[highlightKey]]);
+                setUnitNameSuggestionsOpen(prev => ({ ...prev, [openKey]: false }));
+                setUnitNameHighlightedIndex(prev => ({ ...prev, [highlightKey]: -1 }));
+            }
+        } else if (e.key === 'Escape') {
+            setUnitNameSuggestionsOpen(prev => ({ ...prev, [openKey]: false }));
+            setUnitNameHighlightedIndex(prev => ({ ...prev, [highlightKey]: -1 }));
+            e.preventDefault();
+        }
+    };
 
     const checkSkuExists = (skuToCheck) => {
         return products.some(p => p.sku === skuToCheck && p.id !== editingId);
@@ -2077,23 +2615,38 @@ export default function Inventory({ auth, initial_products, initial_categories, 
     const openAddModal = () => {
         setEditMode(false);
         setEditingId(null);
-        setFormData({ name: '', category_id: '', price: '', cost_price: '', wholesale_price: '', stock_quantity: '', sku: '', image: null, is_active: true });
+        setFormData({
+            name: '', category_id: '', price: '', cost_price: '', wholesale_price: '', stock_quantity: '',
+            sku: '', image: null, is_active: true, selling_method: 'standard', base_unit: '', quantity_decimals: '', units: [],
+        });
         setShowModal(true);
     };
 
     const openEditModal = (p) => {
         setEditMode(true);
         setEditingId(p.id);
+        const isMultiple = p.selling_method === 'multiple';
+
         setFormData({
             name: p.name,
             category_id: p.category_id || '',
-            price: (p.price / 100).toFixed(2),
+            price: p.price !== null && p.price !== undefined ? (p.price / 100).toFixed(2) : '',
             cost_price: p.cost_price ? (p.cost_price / 100).toFixed(2) : '',
-            wholesale_price: p.wholesale_price ? (p.wholesale_price / 100).toFixed(2) : '',
+            wholesale_price: p.wholesale_price !== null && p.wholesale_price !== undefined ? (p.wholesale_price / 100).toFixed(2) : '',
             stock_quantity: p.stock_quantity,
             sku: p.sku,
             image: null,
-            is_active: p.is_active !== undefined ? !!p.is_active : true
+            is_active: p.is_active !== undefined ? !!p.is_active : true,
+            selling_method: isMultiple ? 'multiple' : 'standard',
+            base_unit: p.base_unit || '',
+            quantity_decimals: p.quantity_decimals ?? '',
+            units: (p.units || []).map((unit) => ({
+                name: unit.name,
+                conversion_factor: String(Number(unit.conversion_factor)),
+                price: (unit.price / 100).toFixed(2),
+                wholesale_price: (unit.wholesale_price / 100).toFixed(2),
+                is_default: !!unit.is_default,
+            })),
         });
         setShowModal(true);
     };
@@ -2116,15 +2669,53 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                 return Swal.fire({ icon: 'warning', title: 'Duplicate Barcode', text: `The barcode "${cleanSku}" is already assigned.`, confirmButtonColor: '#3085d6' });
             }
 
+            if (formData.selling_method === 'multiple') {
+                if (!formData.base_unit.trim()) {
+                    setIsSaving(false);
+                    return Swal.fire({ icon: 'warning', title: 'Base Unit Required', text: 'Please enter the base inventory unit (e.g. meter, piece, gram).', confirmButtonColor: '#3085d6' });
+                }
+
+                if (formData.units.length === 0) {
+                    setIsSaving(false);
+                    return Swal.fire({ icon: 'warning', title: 'Selling Unit Required', text: 'Add at least one selling unit for this product.', confirmButtonColor: '#3085d6' });
+                }
+
+                const invalidUnit = formData.units.find((unit) => !unit.name.trim() || Number(unit.conversion_factor) <= 0);
+                if (invalidUnit) {
+                    setIsSaving(false);
+                    return Swal.fire({ icon: 'warning', title: 'Invalid Selling Unit', text: 'Every unit needs a name and a conversion factor greater than zero.', confirmButtonColor: '#3085d6' });
+                }
+
+                if (!formData.units.some((unit) => unit.is_default)) {
+                    setIsSaving(false);
+                    return Swal.fire({ icon: 'warning', title: 'Default Unit Required', text: 'Select which selling unit should be used by default.', confirmButtonColor: '#3085d6' });
+                }
+            }
+
             const data = new FormData();
             data.append('name', cleanName);
             data.append('category_id', formData.category_id);
-            data.append('price', formData.price);
             data.append('cost_price', formData.cost_price);
-            data.append('wholesale_price', formData.wholesale_price);
             data.append('stock_quantity', formData.stock_quantity);
             data.append('sku', cleanSku);
             data.append('is_active', formData.is_active ? '1' : '0');
+            data.append('selling_method', formData.selling_method);
+
+            if (formData.selling_method === 'multiple') {
+                data.append('base_unit', formData.base_unit);
+                data.append('quantity_decimals', formData.quantity_decimals ?? ''); // '' = auto from base unit
+                data.append('units', JSON.stringify(formData.units.map((unit) => ({
+                    name: unit.name,
+                    conversion_factor: unit.conversion_factor,
+                    price: unit.price,
+                    wholesale_price: unit.wholesale_price,
+                    is_default: !!unit.is_default,
+                }))));
+            } else {
+                data.append('price', formData.price);
+                data.append('wholesale_price', formData.wholesale_price);
+            }
+
             if(formData.image) data.append('image', formData.image);
 
             if(editMode) {
@@ -2139,7 +2730,17 @@ export default function Inventory({ auth, initial_products, initial_categories, 
             Swal.fire({ icon: 'success', title: 'Saved!', showConfirmButton: false, timer: 1500 });
 
         } catch(err) {
-            Swal.fire('Error', 'An error occurred while saving the product.', 'error');
+            // Show the server's reason (e.g. validation errors) instead of a generic message
+            const data = err.response?.data;
+            const messages = data?.errors
+                ? [...new Set(Object.values(data.errors).flat())]
+                : [data?.error || data?.message || 'An error occurred while saving the product.'];
+            Swal.fire({
+                icon: 'error',
+                title: 'Could Not Save Product',
+                html: `<div class="text-left text-sm">${messages.map(m => `<div class="py-0.5">• ${String(m).replace(/</g, '&lt;')}</div>`).join('')}</div>`,
+                confirmButtonColor: '#1B3A69',
+            });
         } finally {
             setIsSaving(false);
         }
@@ -2840,9 +3441,22 @@ export default function Inventory({ auth, initial_products, initial_categories, 
 
                                                             {/* Retail & Wholesale Price */}
                                                             <td className="p-4 text-right whitespace-nowrap">
-                                                                <div className="font-black text-gray-900 text-base whitespace-nowrap">{formatCurrency(p.price)}</div>
-                                                                {p.wholesale_price && (
-                                                                    <div className="text-[10px] text-gray-500 font-bold mt-0.5 whitespace-nowrap" title="Wholesale Price">WS: {formatCurrency(p.wholesale_price)}</div>
+                                                                <div className="font-black text-gray-900 text-base whitespace-nowrap">
+                                                                    {formatCurrency(productRetailPrice(p))}
+                                                                    {productPriceUnitSuffix(p) && <span className="text-xs font-bold text-gray-500">{productPriceUnitSuffix(p)}</span>}
+                                                                </div>
+                                                                {productWholesalePrice(p) > 0 && (
+                                                                    <div className="text-[10px] text-gray-500 font-bold mt-0.5 whitespace-nowrap" title="Wholesale Price">WS: {formatCurrency(productWholesalePrice(p))}{productPriceUnitSuffix(p)}</div>
+                                                                )}
+                                                                {p.selling_method === 'multiple' && (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={(e) => { e.stopPropagation(); setUnitsViewProduct(p); }}
+                                                                        className="block ml-auto text-[10px] text-[#1B3B6A] font-bold mt-0.5 whitespace-nowrap underline decoration-dotted underline-offset-2 hover:decoration-solid hover:text-[#142E54]"
+                                                                        title="View selling units"
+                                                                    >
+                                                                        {p.units?.length || 0} selling unit{(p.units?.length || 0) === 1 ? '' : 's'}
+                                                                    </button>
                                                                 )}
                                                             </td>
 
@@ -2855,7 +3469,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                                         ? 'bg-amber-50 text-amber-700 border-amber-200' 
                                                                         : 'bg-emerald-50 text-emerald-700 border-emerald-200'
                                                                 }`}>
-                                                                    {qty} Left
+                                                                    {formatProductQty(p, qty)}{p.selling_method === 'multiple' ? ` ${productUnitLabel(p)}` : ''} Left
                                                                 </span>
                                                             </td>
 
@@ -3031,13 +3645,26 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                         </div>
                                                         <div className="flex justify-between items-end mt-2 pt-1 border-t border-gray-50">
                                                             <div className="flex flex-col">
-                                                                <p className="font-black text-gray-900 text-base sm:text-lg tracking-tight">{formatCurrency(p.price)}</p>
+                                                                <p className="font-black text-gray-900 text-base sm:text-lg tracking-tight">
+                                                                    {formatCurrency(productRetailPrice(p))}
+                                                                    {productPriceUnitSuffix(p) && <span className="text-xs font-bold text-gray-500">{productPriceUnitSuffix(p)}</span>}
+                                                                </p>
                                                                 <span className="text-[10px] sm:text-[11px] font-bold text-gray-500" title="Wholesale Price">
-                                                                    WS: {formatCurrency(p.wholesale_price || 0)}
+                                                                    WS: {formatCurrency(productWholesalePrice(p))}{productPriceUnitSuffix(p)}
                                                                 </span>
+                                                                {p.selling_method === 'multiple' && (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={(e) => { e.stopPropagation(); setUnitsViewProduct(p); }}
+                                                                        className="self-start text-left text-[10px] font-bold text-[#1B3B6A] underline decoration-dotted underline-offset-2 hover:decoration-solid hover:text-[#142E54]"
+                                                                        title="View selling units"
+                                                                    >
+                                                                        {p.units?.length || 0} selling unit{(p.units?.length || 0) === 1 ? '' : 's'}
+                                                                    </button>
+                                                                )}
                                                             </div>
                                                             <span className={`px-2 py-0.5 rounded-none text-[10px] font-black uppercase tracking-wider ${isOut ? 'bg-rose-100 text-rose-700' : isLow ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                                                                {qty} Left
+                                                                {formatProductQty(p, qty)}{p.selling_method === 'multiple' ? ` ${productUnitLabel(p)}` : ''} Left
                                                             </span>
                                                         </div>
                                                     </div>
@@ -3342,6 +3969,434 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                 document.body
             )}
 
+            {/* DOWNLOAD TEMPLATE TYPE CHOOSER */}
+            {showTemplateChooser && typeof document !== 'undefined' && createPortal(
+                <div className="fixed inset-0 z-[110] flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm sm:p-4">
+                    <div className="absolute inset-0" onClick={() => setShowTemplateChooser(false)}></div>
+                    <div className="relative bg-white w-full sm:max-w-lg rounded-none shadow-2xl flex flex-col animate-slide-up sm:animate-fade-in-up">
+                        <div className="flex items-start justify-between border-b border-slate-100 p-5">
+                            <div>
+                                <h2 className="text-lg font-black tracking-tight text-slate-900">Download Import Template</h2>
+                                <p className="text-xs text-slate-500 mt-1 font-medium">Choose which template to download.</p>
+                            </div>
+                            <button onClick={() => setShowTemplateChooser(false)} className="p-2 bg-slate-50 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-none transition-colors" aria-label="Close">
+                                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                            </button>
+                        </div>
+
+                        <div className="p-5 space-y-3">
+                            <button
+                                type="button"
+                                onClick={() => generateTemplate(false)}
+                                className="w-full text-left p-4 border-2 border-slate-200 hover:border-[#1B3B6A] hover:bg-[#1B3B6A]/5 rounded-none transition-all group"
+                            >
+                                <div className="flex items-center justify-between gap-3">
+                                    <h3 className="font-black text-sm text-slate-900 uppercase tracking-wide">Standard Template</h3>
+                                    <span className="text-[10px] font-black uppercase tracking-wider text-[#1B3B6A] opacity-60 group-hover:opacity-100">Download</span>
+                                </div>
+                                <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
+                                    One sheet, 7 columns: SKU, Name, Category, Retail, Wholesale, Cost, Stock.
+                                    For Standard products only.
+                                </p>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => generateTemplate(true)}
+                                className="w-full text-left p-4 border-2 border-slate-200 hover:border-[#1B3B6A] hover:bg-[#1B3B6A]/5 rounded-none transition-all group"
+                            >
+                                <div className="flex items-center justify-between gap-3">
+                                    <h3 className="font-black text-sm text-slate-900 uppercase tracking-wide">Complete Template</h3>
+                                    <span className="text-[10px] font-black uppercase tracking-wider text-[#1B3B6A] opacity-60 group-hover:opacity-100">Download</span>
+                                </div>
+                                <p className="text-xs text-slate-600 mt-1.5 leading-relaxed">
+                                    Products sheet (10 columns) + Product Units sheet + Instructions.
+                                    For Standard and Multiple UOM products, with examples.
+                                </p>
+                            </button>
+                        </div>
+
+                        <div className="px-5 pb-5 flex justify-end">
+                            <button onClick={() => setShowTemplateChooser(false)} className="px-4 py-2.5 border border-slate-300 text-slate-700 font-bold text-xs uppercase tracking-wider hover:bg-slate-50 rounded-none">
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>,
+                document.body
+            )}
+
+            {/* IMPORT PREVIEW MODAL */}
+            {importPreview && typeof document !== 'undefined' && createPortal(
+                (() => {
+                    const ip = importPreview;
+                    const busy = ip.submitting;
+                    const hasErrors = ip.errors.length > 0;
+                    const existingCount = ip.products.filter(p => p.existingProduct).length;
+                    const willUpdateStock = ip.overwrite && ip.updateStock;
+                    const stockDiffers = (p) => p.stock_provided && Number(p.stock_quantity) !== Number(p.existingProduct?.stock_quantity);
+                    const stockChanges = willUpdateStock ? ip.products.filter(p => p.existingProduct && stockDiffers(p)).length : 0;
+                    const importCount = ip.products.length - (ip.overwrite ? 0 : existingCount);
+                    const qty = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 4 });
+                    const money = (n) => (n === null || n === undefined ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+                    const defaultUnitOf = (sku) => ip.units.find(u => u.sku === sku && u.is_default === 'yes');
+                    const setOption = (patch) => !busy && setImportPreview(prev => ({ ...prev, ...patch, serverErrors: [] }));
+                    const close = () => { if (!busy) setImportPreview(null); };
+                    const MAX_ROWS = 300;
+
+                    return (
+                        <div className="fixed inset-0 z-[110] flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm sm:p-4">
+                            <div className="absolute inset-0" onClick={close}></div>
+                            <div className="relative bg-white w-full sm:max-w-5xl max-h-[95vh] sm:max-h-[90vh] rounded-none shadow-2xl flex flex-col animate-slide-up sm:animate-fade-in-up">
+                                {/* Header */}
+                                <div className="flex items-start justify-between border-b border-slate-100 p-5 shrink-0">
+                                    <div className="min-w-0">
+                                        <h2 className="text-lg font-black tracking-tight text-slate-900">Import Preview</h2>
+                                        <p className="text-xs text-slate-500 mt-1 font-medium truncate">{ip.fileName}</p>
+                                    </div>
+                                    <button onClick={close} disabled={busy} className="p-2 bg-slate-50 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-none transition-colors disabled:opacity-40" aria-label="Close">
+                                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                                    </button>
+                                </div>
+
+                                {/* Body */}
+                                <div className="overflow-y-auto p-5 space-y-5">
+                                    {/* Summary */}
+                                    <div>
+                                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                                            {[
+                                                { label: 'Products in File', value: ip.summary.totalProducts, cls: 'bg-slate-50 border-slate-200 text-slate-900' },
+                                                { label: 'New', value: ip.summary.newProducts, cls: 'bg-emerald-50 border-emerald-100 text-emerald-800' },
+                                                { label: ip.overwrite ? 'To Update' : 'To Skip', value: existingCount, cls: ip.overwrite ? 'bg-blue-50 border-blue-100 text-blue-800' : 'bg-slate-100 border-slate-200 text-slate-600' },
+                                                { label: 'Selling Units', value: ip.summary.totalUnits, cls: 'bg-indigo-50 border-indigo-100 text-indigo-800' },
+                                            ].map(card => (
+                                                <div key={card.label} className={`p-3 border rounded-none ${card.cls}`}>
+                                                    <p className="text-2xl font-black">{card.value}</p>
+                                                    <p className="text-[10px] font-bold uppercase tracking-wider opacity-80">{card.label}</p>
+                                                </div>
+                                            ))}
+                                        </div>
+                                        <p className="text-[11px] text-slate-500 mt-2">
+                                            {ip.summary.standardProducts} Standard · {ip.summary.multipleUomProducts} Multiple UOM
+                                        </p>
+                                    </div>
+
+                                    {/* File validation errors */}
+                                    {hasErrors && (
+                                        <div className="p-3 bg-rose-50 border border-rose-200 rounded-none">
+                                            <h4 className="font-black text-rose-900 text-[11px] uppercase tracking-wider mb-1">
+                                                {ip.errors.length} problem{ip.errors.length === 1 ? '' : 's'} found — fix the file and import again
+                                            </h4>
+                                            <div className="max-h-40 overflow-y-auto text-xs text-rose-800 font-mono space-y-0.5">
+                                                {ip.errors.map((e, i) => <div key={i}>{e}</div>)}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Errors returned by the server */}
+                                    {ip.serverErrors?.length > 0 && (
+                                        <div className="p-3 bg-rose-50 border border-rose-200 rounded-none">
+                                            <h4 className="font-black text-rose-900 text-[11px] uppercase tracking-wider mb-1">Import failed — nothing was saved</h4>
+                                            <div className="max-h-40 overflow-y-auto text-xs text-rose-800 font-mono space-y-0.5">
+                                                {ip.serverErrors.map((e, i) => <div key={i}>{e}</div>)}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {ip.warnings.length > 0 && (
+                                        <div className="p-3 bg-amber-50 border border-amber-200 rounded-none">
+                                            <h4 className="font-black text-amber-900 text-[11px] uppercase tracking-wider mb-1">Warnings</h4>
+                                            <div className="max-h-32 overflow-y-auto text-xs text-amber-800 font-mono space-y-0.5">
+                                                {ip.warnings.map((w, i) => <div key={i}>{w}</div>)}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Options for products that already exist */}
+                                    {existingCount > 0 && (
+                                        <div className="border border-slate-200 rounded-none p-4 space-y-3">
+                                            <h4 className="font-black text-slate-900 text-[11px] uppercase tracking-wider">
+                                                {existingCount} product{existingCount === 1 ? '' : 's'} already exist (same SKU)
+                                            </h4>
+                                            <div className="grid sm:grid-cols-2 gap-2">
+                                                {[
+                                                    { value: true, title: 'Update details', text: 'Name, category, prices, cost and selling units are replaced with the file values.' },
+                                                    { value: false, title: 'Skip', text: 'Leave existing products unchanged. Only new products are imported.' },
+                                                ].map(opt => (
+                                                    <label key={String(opt.value)} className={`flex gap-3 p-3 border-2 cursor-pointer rounded-none transition-colors ${ip.overwrite === opt.value ? 'border-[#1B3B6A] bg-[#1B3B6A]/5' : 'border-slate-200 hover:border-slate-300'}`}>
+                                                        <input
+                                                            type="radio"
+                                                            name="import-existing"
+                                                            checked={ip.overwrite === opt.value}
+                                                            onChange={() => setOption({ overwrite: opt.value })}
+                                                            disabled={busy}
+                                                            className="mt-0.5 text-[#1B3B6A] focus:ring-[#1B3B6A]"
+                                                        />
+                                                        <span>
+                                                            <span className="block text-sm font-bold text-slate-900">{opt.title}</span>
+                                                            <span className="block text-[11px] text-slate-500 mt-0.5 leading-relaxed">{opt.text}</span>
+                                                        </span>
+                                                    </label>
+                                                ))}
+                                            </div>
+
+                                            <label className={`flex gap-3 p-3 border rounded-none ${ip.overwrite ? 'cursor-pointer border-slate-200 hover:border-slate-300' : 'opacity-50 cursor-not-allowed border-slate-100'} ${willUpdateStock ? 'bg-amber-50 border-amber-300' : ''}`}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={willUpdateStock}
+                                                    onChange={(e) => setOption({ updateStock: e.target.checked })}
+                                                    disabled={busy || !ip.overwrite}
+                                                    className="mt-0.5 text-[#1B3B6A] focus:ring-[#1B3B6A] rounded-none"
+                                                />
+                                                <span>
+                                                    <span className="block text-sm font-bold text-slate-900">Also update stock from the file</span>
+                                                    <span className="block text-[11px] text-slate-500 mt-0.5 leading-relaxed">
+                                                        Use after a physical count. Each change is recorded as a stock adjustment in the stock ledger.
+                                                        Blank stock cells are left unchanged.
+                                                    </span>
+                                                    {willUpdateStock && (
+                                                        <span className="block text-[11px] font-bold text-amber-800 mt-1.5">
+                                                            {stockChanges > 0
+                                                                ? `Stock will change on ${stockChanges} product${stockChanges === 1 ? '' : 's'} (see the Stock column).`
+                                                                : 'No stock differences found — stock stays the same.'}
+                                                        </span>
+                                                    )}
+                                                    {!willUpdateStock && ip.overwrite && (
+                                                        <span className="block text-[11px] font-bold text-slate-600 mt-1.5">Existing stock is kept.</span>
+                                                    )}
+                                                </span>
+                                            </label>
+                                        </div>
+                                    )}
+
+                                    {/* Products */}
+                                    <div>
+                                        <h4 className="font-black text-slate-900 text-[11px] uppercase tracking-wider mb-2">Products</h4>
+                                        <div className="overflow-x-auto border border-slate-200 max-h-80 overflow-y-auto">
+                                            <table className="w-full text-xs">
+                                                <thead className="bg-[#1B3A69] text-white text-[10px] uppercase tracking-wider sticky top-0">
+                                                    <tr>
+                                                        <th className="text-left p-2.5 font-black">Row</th>
+                                                        <th className="text-left p-2.5 font-black">SKU</th>
+                                                        <th className="text-left p-2.5 font-black">Product</th>
+                                                        <th className="text-left p-2.5 font-black">Category</th>
+                                                        <th className="text-left p-2.5 font-black">Method</th>
+                                                        <th className="text-right p-2.5 font-black">Retail / WS</th>
+                                                        <th className="text-right p-2.5 font-black">Stock</th>
+                                                        <th className="text-center p-2.5 font-black">Action</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {ip.products.slice(0, MAX_ROWS).map((p, i) => {
+                                                        const isMulti = p.selling_method === 'multiple';
+                                                        const unitLabel = isMulti && p.base_unit ? ` ${p.base_unit}` : '';
+                                                        const defUnit = isMulti ? defaultUnitOf(p.sku) : null;
+                                                        const existing = p.existingProduct;
+                                                        const action = !existing ? 'NEW' : (ip.overwrite ? 'UPDATE' : 'SKIP');
+                                                        const actionCls = action === 'NEW' ? 'bg-emerald-100 text-emerald-800' : action === 'UPDATE' ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-500';
+
+                                                        let stockCell;
+                                                        if (!existing) {
+                                                            stockCell = <span className="text-slate-800">{qty(p.stock_quantity)}{unitLabel}</span>;
+                                                        } else if (willUpdateStock && stockDiffers(p)) {
+                                                            stockCell = (
+                                                                <span className="font-bold text-amber-700 whitespace-nowrap">
+                                                                    {qty(existing.stock_quantity)} → {qty(p.stock_quantity)}{unitLabel}
+                                                                </span>
+                                                            );
+                                                        } else {
+                                                            stockCell = (
+                                                                <span className="text-slate-500 whitespace-nowrap" title="Current stock is kept">
+                                                                    {qty(existing.stock_quantity)}{unitLabel} <span className="text-[10px]">(kept)</span>
+                                                                </span>
+                                                            );
+                                                        }
+
+                                                        return (
+                                                            <tr key={`${p.rowNum}-${i}`} className={action === 'SKIP' ? 'opacity-60' : ''}>
+                                                                <td className="p-2.5 text-slate-400 font-mono">{p.rowNum}</td>
+                                                                <td className="p-2.5 font-mono font-bold text-slate-900 whitespace-nowrap">{p.sku || '—'}</td>
+                                                                <td className="p-2.5 text-slate-800 max-w-[220px] truncate" title={p.name}>{p.name || '—'}</td>
+                                                                <td className="p-2.5 text-slate-600 whitespace-nowrap">{p.category_name || '—'}</td>
+                                                                <td className="p-2.5 whitespace-nowrap">
+                                                                    {isMulti
+                                                                        ? <span className="text-purple-800 font-bold">Multiple UOM</span>
+                                                                        : <span className="text-slate-600">Standard</span>}
+                                                                </td>
+                                                                <td className="p-2.5 text-right whitespace-nowrap text-slate-800">
+                                                                    {isMulti
+                                                                        ? (defUnit ? <>{money(defUnit.retail_price)} / {money(defUnit.wholesale_price)} <span className="text-slate-400">({defUnit.unit_name})</span></> : '—')
+                                                                        : <>{money(p.price)} / {money(p.wholesale_price)}</>}
+                                                                </td>
+                                                                <td className="p-2.5 text-right">{stockCell}</td>
+                                                                <td className="p-2.5 text-center">
+                                                                    <span className={`px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider ${actionCls}`}>{action}</span>
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                        {ip.products.length > MAX_ROWS && (
+                                            <p className="text-[11px] text-slate-500 mt-1.5">Showing the first {MAX_ROWS} of {ip.products.length} rows. All rows will be imported.</p>
+                                        )}
+                                    </div>
+
+                                    {/* Selling units */}
+                                    {ip.units.length > 0 && (
+                                        <div>
+                                            <h4 className="font-black text-slate-900 text-[11px] uppercase tracking-wider mb-2">Selling Units ({ip.units.length})</h4>
+                                            <div className="overflow-x-auto border border-slate-200 max-h-60 overflow-y-auto">
+                                                <table className="w-full text-xs">
+                                                    <thead className="bg-slate-100 text-slate-600 text-[10px] uppercase tracking-wider sticky top-0">
+                                                        <tr>
+                                                            <th className="text-left p-2.5 font-black">SKU</th>
+                                                            <th className="text-left p-2.5 font-black">Unit</th>
+                                                            <th className="text-right p-2.5 font-black">Conversion</th>
+                                                            <th className="text-right p-2.5 font-black">Retail</th>
+                                                            <th className="text-right p-2.5 font-black">Wholesale</th>
+                                                            <th className="text-center p-2.5 font-black">Default</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100">
+                                                        {ip.units.slice(0, MAX_ROWS).map((u, i) => (
+                                                            <tr key={`${u.rowNum}-${i}`} className={u.is_default === 'yes' ? 'bg-amber-50/60' : ''}>
+                                                                <td className="p-2.5 font-mono font-bold text-slate-900 whitespace-nowrap">{u.sku}</td>
+                                                                <td className="p-2.5 text-slate-800 whitespace-nowrap">{u.unit_name}</td>
+                                                                <td className="p-2.5 text-right text-slate-600">× {qty(u.conversion_factor)}</td>
+                                                                <td className="p-2.5 text-right text-slate-800">{money(u.retail_price)}</td>
+                                                                <td className="p-2.5 text-right text-slate-600">{money(u.wholesale_price)}</td>
+                                                                <td className="p-2.5 text-center">
+                                                                    {u.is_default === 'yes' && <span className="px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-800">Default</span>}
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Footer */}
+                                <div className="p-5 border-t border-slate-100 flex flex-col-reverse sm:flex-row gap-3 sm:items-center sm:justify-between shrink-0">
+                                    <p className="text-[11px] text-slate-500">
+                                        {hasErrors
+                                            ? 'Import is disabled until the problems above are fixed.'
+                                            : `${importCount} product${importCount === 1 ? '' : 's'} will be ${ip.overwrite && existingCount > 0 ? 'imported or updated' : 'imported'}.`}
+                                    </p>
+                                    <div className="flex gap-3 justify-end">
+                                        <button onClick={close} disabled={busy} className="px-4 py-2.5 border border-slate-300 text-slate-700 font-bold text-xs uppercase tracking-wider hover:bg-slate-50 rounded-none disabled:opacity-40">
+                                            Cancel
+                                        </button>
+                                        <button
+                                            onClick={submitImport}
+                                            disabled={hasErrors || busy || importCount === 0}
+                                            className="px-5 py-2.5 bg-[#1B3B6A] text-white font-black text-xs uppercase tracking-wider hover:bg-[#142E54] rounded-none disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
+                                        >
+                                            {busy && (
+                                                <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" /></svg>
+                                            )}
+                                            {busy ? 'Importing...' : 'Confirm & Import'}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })(),
+                document.body
+            )}
+
+            {/* VIEW SELLING UNITS MODAL (Multiple UOM) */}
+            {unitsViewProduct && typeof document !== 'undefined' && createPortal(
+                (() => {
+                    // Use the latest copy of the product (list re-polls every few seconds)
+                    const vp = products.find(x => x.id === unitsViewProduct.id) || unitsViewProduct;
+                    const units = [...(vp.units || [])].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0));
+                    const baseUnit = vp.base_unit || 'base unit';
+                    const fmtFactor = (n) => Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 8 });
+                    const close = () => setUnitsViewProduct(null);
+                    return (
+                        <div className="fixed inset-0 z-[110] flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm sm:p-4">
+                            <div className="absolute inset-0" onClick={close}></div>
+                            <div className="relative bg-white w-full sm:max-w-2xl max-h-[90vh] rounded-none shadow-2xl flex flex-col animate-slide-up sm:animate-fade-in-up">
+                                <div className="flex items-start justify-between border-b border-slate-100 p-5 shrink-0">
+                                    <div className="min-w-0">
+                                        <h2 className="text-lg font-black tracking-tight text-slate-900">Selling Units</h2>
+                                        <p className="text-xs text-slate-500 mt-1 font-medium truncate">
+                                            {vp.name} <span className="font-mono text-slate-400">· {vp.sku}</span>
+                                        </p>
+                                        <p className="text-[11px] text-slate-500 mt-1">
+                                            Base unit: <span className="font-bold text-slate-700">{baseUnit}</span>
+                                            {' · '}Stock: <span className="font-bold text-slate-700">{formatProductQty(vp, vp.stock_quantity)} {baseUnit}</span>
+                                            {vp.cost_price ? <>{' · '}Cost: <span className="font-bold text-slate-700">{formatCurrency(vp.cost_price)} / {baseUnit}</span></> : null}
+                                        </p>
+                                    </div>
+                                    <button onClick={close} className="p-2 bg-slate-50 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-none transition-colors shrink-0" aria-label="Close">
+                                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                                    </button>
+                                </div>
+
+                                <div className="overflow-y-auto p-5">
+                                    {units.length === 0 ? (
+                                        <p className="text-sm text-slate-500 text-center py-8">No selling units configured for this product.</p>
+                                    ) : (
+                                        <div className="overflow-x-auto border border-slate-200">
+                                            <table className="w-full text-sm">
+                                                <thead className="bg-[#1B3A69] text-white text-[10px] uppercase tracking-wider">
+                                                    <tr>
+                                                        <th className="text-left p-3 font-black">Unit</th>
+                                                        <th className="text-right p-3 font-black whitespace-nowrap">Contains</th>
+                                                        <th className="text-right p-3 font-black whitespace-nowrap">Retail</th>
+                                                        <th className="text-right p-3 font-black whitespace-nowrap">Wholesale</th>
+                                                        <th className="text-right p-3 font-black whitespace-nowrap">Available</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {units.map((u) => {
+                                                        const factor = Number(u.conversion_factor) || 0;
+                                                        const available = factor > 0 ? Math.floor((Number(vp.stock_quantity) || 0) / factor) : 0;
+                                                        return (
+                                                            <tr key={u.id ?? u.name} className={u.is_default ? 'bg-amber-50/60' : ''}>
+                                                                <td className="p-3 font-bold text-slate-900 whitespace-nowrap">
+                                                                    {u.name}
+                                                                    {u.is_default && (
+                                                                        <span className="ml-2 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider bg-amber-100 text-amber-800">Default</span>
+                                                                    )}
+                                                                </td>
+                                                                <td className="p-3 text-right text-slate-600 whitespace-nowrap">{fmtFactor(factor)} {baseUnit}</td>
+                                                                <td className="p-3 text-right font-bold text-slate-900 whitespace-nowrap">{formatCurrency(u.price)}</td>
+                                                                <td className="p-3 text-right text-slate-600 whitespace-nowrap">{formatCurrency(u.wholesale_price)}</td>
+                                                                <td className="p-3 text-right text-slate-600 whitespace-nowrap">{available.toLocaleString('en-US')}</td>
+                                                            </tr>
+                                                        );
+                                                    })}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="p-5 border-t border-slate-100 flex gap-3 justify-end shrink-0">
+                                    <button onClick={close} className="px-4 py-2.5 border border-slate-300 text-slate-700 font-bold text-xs uppercase tracking-wider hover:bg-slate-50 rounded-none">
+                                        Close
+                                    </button>
+                                    <button
+                                        onClick={() => { close(); openEditModal(vp); }}
+                                        className="px-4 py-2.5 bg-[#1B3B6A] text-white font-black text-xs uppercase tracking-wider hover:bg-[#142E54] rounded-none"
+                                    >
+                                        Edit Units
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    );
+                })(),
+                document.body
+            )}
+
             {/* PRODUCT ADD/EDIT MODAL */}
             {showModal && typeof document !== 'undefined' && createPortal(
                 <div className={`fixed inset-0 bg-black/60 flex items-end sm:items-center justify-center z-[100] sm:p-6 backdrop-blur-sm animate-in fade-in duration-300 ${showScanner ? 'hidden' : ''}`}>
@@ -3415,26 +4470,273 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                         </select>
                                     </div>
                                     <div>
-                                         <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Initial Stock</label>
-                                         <input type="number" name="stock_quantity" required value={formData.stock_quantity} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400" placeholder="0" />
+                                        <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Selling Method</label>
+                                        <select
+                                            name="selling_method"
+                                            value={formData.selling_method}
+                                            onChange={(e) => handleSellingMethodChange(e.target.value)}
+                                            className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm"
+                                        >
+                                            <option value="standard">Standard Quantity</option>
+                                            <option value="multiple">Multiple Units (UOM)</option>
+                                        </select>
                                     </div>
                                 </div>
 
-                                <div>
-                                     <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Cost Price</label>
-                                     <input type="number" step="0.01" name="cost_price" required value={formData.cost_price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
-                                </div>
+                                {formData.selling_method === 'standard' ? (
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                                        <div>
+                                             <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Initial Stock</label>
+                                             <input
+                                                 type="number"
+                                                 step="1"
+                                                 min="0"
+                                                 name="stock_quantity"
+                                                 required
+                                                 value={formData.stock_quantity}
+                                                 onChange={handleChange}
+                                                 className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400"
+                                                 placeholder="0"
+                                             />
+                                        </div>
+                                        <div>
+                                             <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Cost Price</label>
+                                             <input type="number" step="0.01" name="cost_price" required value={formData.cost_price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+                                            <div className="relative">
+                                                <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Base Inventory Unit</label>
+                                                <input
+                                                    name="base_unit"
+                                                    required
+                                                    value={formData.base_unit}
+                                                    onChange={handleChange}
+                                                    onFocus={() => setBaseUnitSuggestionsOpen(true)}
+                                                    onBlur={() => setTimeout(() => setBaseUnitSuggestionsOpen(false), 250)}
+                                                    onKeyDown={handleBaseUnitKeyDown}
+                                                    autoComplete="off"
+                                                    className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400"
+                                                    placeholder="e.g. meter, piece, gram"
+                                                />
+                                                {baseUnitSuggestionsOpen && filteredBaseUnits.length > 0 && (
+                                                    <div className="absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-none shadow-xl z-30 max-h-48 overflow-y-auto custom-scrollbar divide-y divide-slate-100 animate-in fade-in zoom-in-95 duration-150">
+                                                        <div className="px-3 py-1.5 bg-slate-50 text-[10px] font-black uppercase tracking-wider text-slate-400">
+                                                            Suggestions ({filteredBaseUnits.length})
+                                                        </div>
+                                                        {filteredBaseUnits.map((unit, idx) => {
+                                                            const isHighlighted = baseUnitHighlightedIndex === idx;
+                                                            return (
+                                                                <button
+                                                                    key={idx}
+                                                                    type="button"
+                                                                    onMouseDown={(e) => {
+                                                                        e.preventDefault();
+                                                                        setFormData(prev => ({ ...prev, base_unit: unit }));
+                                                                        setBaseUnitSuggestionsOpen(false);
+                                                                        setBaseUnitHighlightedIndex(-1);
+                                                                    }}
+                                                                    onMouseEnter={() => setBaseUnitHighlightedIndex(idx)}
+                                                                    className={`w-full text-left px-3.5 py-2.5 text-xs transition-colors flex items-center justify-between group cursor-pointer ${
+                                                                        isHighlighted
+                                                                            ? 'bg-[#EFF4F9] text-[#1B3B6A]'
+                                                                            : 'text-slate-700 hover:bg-slate-50'
+                                                                    }`}
+                                                                >
+                                                                    <span>{unit}</span>
+                                                                </button>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            <div>
+                                                 <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Initial Stock ({formData.base_unit || 'base unit'})</label>
+                                                 <input
+                                                     type="number"
+                                                     step="0.00000001"
+                                                     min="0"
+                                                     name="stock_quantity"
+                                                     required
+                                                     value={formData.stock_quantity}
+                                                     onChange={handleChange}
+                                                     className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400"
+                                                     placeholder="0"
+                                                 />
+                                            </div>
+                                        </div>
 
-                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 font-mono">
-                                    <div>
-                                        <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5 font-sans">Retail Price</label>
-                                        <input type="number" step="0.01" name="price" required value={formData.price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
+                                        <div>
+                                            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Quantity Decimals</label>
+                                            <select
+                                                name="quantity_decimals"
+                                                value={formData.quantity_decimals ?? ''}
+                                                onChange={handleChange}
+                                                className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm"
+                                            >
+                                                <option value="">Auto: {defaultQuantityDecimals(formData.base_unit)} for "{formData.base_unit || 'base unit'}"</option>
+                                                <option value="0">0 - whole quantities only (e.g. 3 pcs)</option>
+                                                <option value="1">1 (e.g. 2.5)</option>
+                                                <option value="2">2 (e.g. 12.75 m)</option>
+                                                <option value="3">3 (e.g. 1.250 kg)</option>
+                                                <option value="4">4 (e.g. 0.3048)</option>
+                                            </select>
+                                            <p className="text-[11px] text-slate-500 mt-1.5 ml-0.5 leading-relaxed">
+                                                Max decimal places the cashier can enter (in any selling unit) and that stock is shown with. Stock is always stored exactly.
+                                            </p>
+                                        </div>
+
+                                        <div>
+                                             <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Cost Price per {formData.base_unit || 'Base Unit'}</label>
+                                             <input type="number" step="0.01" name="cost_price" required value={formData.cost_price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
+                                        </div>
+                                    </>
+                                )}
+
+                                {formData.selling_method === 'multiple' ? (
+                                    <div className="space-y-3">
+                                        <div className="flex items-center justify-between">
+                                            <div>
+                                                <h3 className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">Selling Units</h3>
+                                                <p className="text-[10px] text-slate-500 mt-0.5">Conversion factor = how many base units each selling unit contains.</p>
+                                            </div>
+                                            <button type="button" onClick={addUnitRow} className="text-xs font-bold text-[#1B3B6A] hover:underline">
+                                                + Add Unit
+                                            </button>
+                                        </div>
+
+                                        {formData.units.map((unit, index) => (
+                                            <div key={index} className="border border-slate-200 bg-slate-50/60 p-4 space-y-3">
+                                                <div className="flex items-center justify-between gap-3">
+                                                    <label className="flex items-center gap-2 text-xs font-bold text-slate-700 cursor-pointer">
+                                                        <input
+                                                            type="radio"
+                                                            name="default_unit"
+                                                            checked={!!unit.is_default}
+                                                            onChange={() => handleUnitChange(index, 'is_default', true)}
+                                                            className="w-4 h-4 text-[#1B3B6A] border-slate-300 focus:ring-[#1B3B6A]"
+                                                        />
+                                                        Default unit
+                                                    </label>
+                                                    {formData.units.length > 1 && (
+                                                        <button type="button" onClick={() => removeUnitRow(index)} className="text-[11px] font-bold text-rose-600 hover:underline">
+                                                            Remove
+                                                        </button>
+                                                    )}
+                                                </div>
+
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                                    <div className="relative">
+                                                        <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-1">Unit Name</label>
+                                                        <input
+                                                            required
+                                                            value={unit.name}
+                                                            onChange={(e) => handleUnitChange(index, 'name', e.target.value)}
+                                                            onFocus={() => setUnitNameSuggestionsOpen(prev => ({ ...prev, [`open_${index}`]: true }))}
+                                                            onBlur={() => setTimeout(() => setUnitNameSuggestionsOpen(prev => ({ ...prev, [`open_${index}`]: false })), 250)}
+                                                            onKeyDown={(e) => handleUnitNameKeyDown(index, e)}
+                                                            autoComplete="off"
+                                                            className="w-full border border-slate-300 bg-white rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] py-2.5 px-3 text-sm font-semibold text-slate-900"
+                                                            placeholder="e.g. Roll"
+                                                        />
+                                                        {unitNameSuggestionsOpen[`open_${index}`] && getFilteredUnitNames(unit.name).length > 0 && (
+                                                            <div className="absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-none shadow-xl z-30 max-h-48 overflow-y-auto custom-scrollbar divide-y divide-slate-100 animate-in fade-in zoom-in-95 duration-150">
+                                                                <div className="px-3 py-1.5 bg-slate-50 text-[10px] font-black uppercase tracking-wider text-slate-400">
+                                                                    Suggestions ({getFilteredUnitNames(unit.name).length})
+                                                                </div>
+                                                                {getFilteredUnitNames(unit.name).map((u, idx) => {
+                                                                    const isHighlighted = unitNameHighlightedIndex[`highlight_${index}`] === idx;
+                                                                    return (
+                                                                        <button
+                                                                            key={idx}
+                                                                            type="button"
+                                                                            onMouseDown={(e) => {
+                                                                                e.preventDefault();
+                                                                                handleUnitChange(index, 'name', u);
+                                                                                setUnitNameSuggestionsOpen(prev => ({ ...prev, [`open_${index}`]: false }));
+                                                                                setUnitNameHighlightedIndex(prev => ({ ...prev, [`highlight_${index}`]: -1 }));
+                                                                            }}
+                                                                            onMouseEnter={() => setUnitNameHighlightedIndex(prev => ({ ...prev, [`highlight_${index}`]: idx }))}
+                                                                            className={`w-full text-left px-3.5 py-2.5 text-xs transition-colors flex items-center justify-between group cursor-pointer ${
+                                                                                isHighlighted
+                                                                                    ? 'bg-[#EFF4F9] text-[#1B3B6A]'
+                                                                                    : 'text-slate-700 hover:bg-slate-50'
+                                                                            }`}
+                                                                        >
+                                                                            <span>{u}</span>
+                                                                        </button>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-1">
+                                                            Conversion Factor ({formData.base_unit || 'base units'})
+                                                        </label>
+                                                        <input
+                                                            type="number"
+                                                            step="0.00000001"
+                                                            min="0.00000001"
+                                                            required
+                                                            value={unit.conversion_factor}
+                                                            onChange={(e) => handleUnitChange(index, 'conversion_factor', e.target.value)}
+                                                            className="w-full border border-slate-300 bg-white rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] py-2.5 px-3 text-sm font-semibold text-slate-900 font-mono"
+                                                            placeholder="e.g. 100"
+                                                        />
+                                                        {repeatingFactorHint(unit.conversion_factor, formData.base_unit, unit.name) && (
+                                                            <p className="mt-1.5 text-[11px] font-semibold text-amber-700 leading-relaxed font-sans">
+                                                                ⚠ {repeatingFactorHint(unit.conversion_factor, formData.base_unit, unit.name)}
+                                                            </p>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 font-mono">
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-1 font-sans">Retail Price / {unit.name || 'unit'}</label>
+                                                        <input
+                                                            type="number"
+                                                            step="0.01"
+                                                            min="0"
+                                                            required
+                                                            value={unit.price}
+                                                            onChange={(e) => handleUnitChange(index, 'price', e.target.value)}
+                                                            className="w-full border border-slate-300 bg-white rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] py-2.5 px-3 text-sm font-semibold text-slate-900 font-mono"
+                                                            placeholder="0.00"
+                                                        />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-1 font-sans">Wholesale Price / {unit.name || 'unit'}</label>
+                                                        <input
+                                                            type="number"
+                                                            step="0.01"
+                                                            min="0"
+                                                            required
+                                                            value={unit.wholesale_price}
+                                                            onChange={(e) => handleUnitChange(index, 'wholesale_price', e.target.value)}
+                                                            className="w-full border border-slate-300 bg-white rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] py-2.5 px-3 text-sm font-semibold text-slate-900 font-mono"
+                                                            placeholder="0.00"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        ))}
                                     </div>
-                                    <div>
-                                        <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5 font-sans">Wholesale Price</label>
-                                        <input type="number" step="0.01" name="wholesale_price" required value={formData.wholesale_price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
+                                ) : (
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 font-mono">
+                                        <div>
+                                            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5 font-sans">Retail Price</label>
+                                            <input type="number" step="0.01" name="price" required value={formData.price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5 font-sans">Wholesale Price</label>
+                                            <input type="number" step="0.01" name="wholesale_price" required value={formData.wholesale_price} onChange={handleChange} className="w-full border border-slate-300 bg-slate-50/50 rounded-none focus:ring-2 focus:ring-[#1B3B6A] focus:border-[#1B3B6A] focus:bg-white transition-all py-3 px-4 text-sm font-semibold text-slate-900 shadow-sm placeholder:text-slate-400 font-mono" placeholder="0.00" />
+                                        </div>
                                     </div>
-                                </div>
+                                )}
 
                                 <div>
                                     <label className="block text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 ml-0.5">Product Image (Optional)</label>
@@ -3521,7 +4823,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                     <p className="text-[11px] sm:text-xs text-white/80 font-mono flex items-center gap-1.5 mt-0.5 truncate whitespace-nowrap overflow-hidden">
                                         <span>SKU: {historyModal.product?.sku || 'N/A'}</span>
                                         <span>•</span>
-                                        <span>{historyModal.data?.stats?.current_stock ?? historyModal.product?.stock_quantity ?? 0} units</span>
+                                        <span>{fmtLedgerQty(historyModal.data?.stats?.current_stock ?? historyModal.product?.stock_quantity ?? 0)} {ledgerUnit()}</span>
                                         <span className="hidden sm:inline">•</span>
                                         <span className="hidden sm:inline truncate">{historyModal.product?.category?.name || historyModal.data?.product?.category_name || 'General'}</span>
                                     </p>
@@ -3715,7 +5017,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                                         </span>
                                                                     ) : (
                                                                         <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-none text-[10px] font-black bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
-                                                                            Adjustment
+                                                                            {row.subtype === 'void_return' ? 'Void Return' : 'Adjustment'}
                                                                         </span>
                                                                     )}
                                                                 </td>
@@ -3724,16 +5026,19 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                                 <td className="p-4 text-center whitespace-nowrap font-mono font-black">
                                                                     {row.quantity_change < 0 ? (
                                                                         <span className="inline-flex items-center px-2.5 py-1 rounded-none text-xs font-black bg-rose-50 text-rose-700 border border-rose-200">
-                                                                            {row.quantity_change} units
+                                                                            {ledgerQtyText(row)}
                                                                         </span>
                                                                     ) : row.quantity_change > 0 ? (
                                                                         <span className="inline-flex items-center px-2.5 py-1 rounded-none text-xs font-black bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                                                            +{row.quantity_change} units
+                                                                            {ledgerQtyText(row)}
                                                                         </span>
                                                                     ) : (
                                                                         <span className="inline-flex items-center px-2.5 py-1 rounded-none text-xs font-bold bg-slate-100 text-slate-500 border border-slate-200">
-                                                                            0 units
+                                                                            0 {ledgerUnit()}
                                                                         </span>
+                                                                    )}
+                                                                    {ledgerSellingUnit(row) && (
+                                                                        <div className="text-[10px] font-bold text-slate-500 mt-1 font-sans">{ledgerSellingUnit(row)}</div>
                                                                     )}
                                                                 </td>
 
@@ -3801,7 +5106,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                                     </span>
                                                                 ) : (
                                                                     <span className="inline-flex items-center px-2.5 py-1 rounded-none text-[10px] font-black bg-amber-50 text-amber-700 border border-amber-200 uppercase tracking-wider">
-                                                                        Adjustment
+                                                                        {row.subtype === 'void_return' ? 'Void Return' : 'Adjustment'}
                                                                     </span>
                                                                 )}
                                                             </div>
@@ -3835,16 +5140,19 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                             <div>
                                                                 {row.quantity_change < 0 ? (
                                                                     <span className="text-rose-600 bg-rose-50 px-2.5 py-1 rounded-none border border-rose-200 font-black font-mono text-xs">
-                                                                        {row.quantity_change} units
+                                                                        {ledgerQtyText(row)}
                                                                     </span>
                                                                 ) : row.quantity_change > 0 ? (
                                                                     <span className="text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-none border border-emerald-200 font-black font-mono text-xs">
-                                                                        +{row.quantity_change} units
+                                                                        {ledgerQtyText(row)}
                                                                     </span>
                                                                 ) : (
                                                                     <span className="text-slate-500 bg-slate-50 px-2.5 py-1 rounded-none border border-slate-200 font-bold font-mono text-xs">
                                                                         0
                                                                     </span>
+                                                                )}
+                                                                {ledgerSellingUnit(row) && (
+                                                                    <span className="block text-right text-[10px] font-bold text-slate-500 mt-1">{ledgerSellingUnit(row)}</span>
                                                                 )}
                                                             </div>
                                                         </div>
@@ -3980,6 +5288,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                     let createCount = 0;
                                     let updateCount = 0;
                                     let categoryCount = 0;
+                                    let fileCount = 0;
 
                                     logs.forEach(log => {
                                         const activityType = getActivityType(log);
@@ -3991,6 +5300,8 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                             createCount++;
                                         } else if (activityType === 'category') {
                                             categoryCount++;
+                                        } else if (activityType === 'file') {
+                                            fileCount++;
                                         } else {
                                             updateCount++;
                                         }
@@ -4002,7 +5313,8 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                         { key: 'stock', label: 'Restocks', count: restockCount },
                                         { key: 'create', label: 'New Items', count: createCount },
                                         { key: 'update', label: 'Edits', count: updateCount },
-                                        { key: 'category', label: 'Categories', count: categoryCount }
+                                        { key: 'category', label: 'Categories', count: categoryCount },
+                                        { key: 'file', label: 'Import / Export', count: fileCount }
                                     ];
 
                                     return (
@@ -4120,6 +5432,8 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                 const isRestock = activityType === 'stock';
                                                 const isCreate = activityType === 'create';
                                                 const isCategory = activityType === 'category';
+                                                const isFile = activityType === 'file';
+                                                const stockChange = Number(log.new_values?.quantity_change ?? log.new_values?.quantity_added ?? 0);
 
                                                 return (
                                                     <div 
@@ -4132,6 +5446,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                             isRestock ? 'bg-emerald-500 ring-emerald-200' :
                                                             isCreate ? 'bg-blue-500 ring-blue-200' :
                                                             isCategory ? 'bg-violet-500 ring-violet-200' :
+                                                            isFile ? 'bg-sky-500 ring-sky-200' :
                                                             'bg-amber-500 ring-amber-200'
                                                         }`}></div>
 
@@ -4147,7 +5462,7 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                                 ) : isRestock ? (
                                                                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-[10px] font-black bg-emerald-50 text-emerald-700 border border-emerald-200 tracking-wider uppercase">
                                                                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-3 h-3"><path strokeLinecap="round" strokeLinejoin="round" d="M2.25 18L9 11.25l4.306 4.307a11.95 11.95 0 015.814-5.519l2.74-1.22m0 0l-5.94-2.28m5.94 2.28l-2.28 5.941" /></svg>
-                                                                        Restock
+                                                                        {log.action === 'stock_void_return' ? 'Void Return' : (stockChange < 0 ? 'Stock Adjusted' : 'Restock')}
                                                                     </span>
                                                                 ) : isCreate ? (
                                                                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-[10px] font-black bg-blue-50 text-blue-700 border border-blue-200 tracking-wider uppercase">
@@ -4158,6 +5473,11 @@ export default function Inventory({ auth, initial_products, initial_categories, 
                                                                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-[10px] font-black bg-violet-50 text-violet-700 border border-violet-200 tracking-wider uppercase">
                                                                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-3 h-3"><path strokeLinecap="round" strokeLinejoin="round" d="M9.568 3H5.25A2.25 2.25 0 003 5.25v4.318c0 .597.237 1.17.659 1.591l9.581 9.581c.699.699 1.78.872 2.607.33a18.095 18.095 0 005.223-5.223c.542-.827.369-1.908-.33-2.607L11.16 3.66A2.25 2.25 0 009.568 3z" /><path strokeLinecap="round" strokeLinejoin="round" d="M6 6h.008v.008H6V6z" /></svg>
                                                                         Category
+                                                                    </span>
+                                                                ) : isFile ? (
+                                                                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-[10px] font-black bg-sky-50 text-sky-700 border border-sky-200 tracking-wider uppercase">
+                                                                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-3 h-3"><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" /></svg>
+                                                                        {log.action === 'export' ? 'Export' : (log.action === 'import_failed' ? 'Import Rejected' : 'Import')}
                                                                     </span>
                                                                 ) : (
                                                                     <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-none text-[10px] font-black bg-amber-50 text-amber-700 border border-amber-200 tracking-wider uppercase">

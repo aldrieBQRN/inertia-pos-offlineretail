@@ -490,11 +490,12 @@ const usePrinterStore = create(
                     originalSubtotal += amountVal;
 
                     const desc = item.display_name || item.product?.name || item.custom_name || item.name || 'Item';
+                    const descWithUnit = item.unit_name ? `${desc} (${item.unit_name})` : desc;
                     const formattedPrice = fmt(priceVal);
                     const formattedAmount = fmt(amountVal);
 
                     if (is80) {
-                        const nameLines = wrapText(desc, 22);
+                        const nameLines = wrapText(descWithUnit, 22);
                         // Line 0: Qty (5) + Desc Line 0 (22) + Price (10) + Amount (11)
                         let itemLines = quantity.toString().padEnd(5) +
                                         nameLines[0].padEnd(22) +
@@ -509,7 +510,7 @@ const usePrinterStore = create(
                     } else {
                         const descLimit = 21;
                         const priceLimit = 8;
-                        const nameLines = wrapText(desc, descLimit);
+                        const nameLines = wrapText(descWithUnit, descLimit);
 
                         // Row 1: First line of Name (left) and Unit Price (right)
                         let itemLines = nameLines[0].padEnd(descLimit) + " " + formattedPrice.padStart(priceLimit) + "\n";
@@ -520,7 +521,7 @@ const usePrinterStore = create(
                         }
 
                         // Row 2: Quantity (left) and Subtotal Amount (right)
-                        const qtyDetail = `${quantity}x`;
+                        const qtyDetail = `${quantity}`;
                         itemLines += `  ${qtyDetail}`.padEnd(descLimit) + " " + formattedAmount.padStart(priceLimit) + "\n";
 
                         finalCommands.push(...encode(itemLines));
@@ -607,7 +608,7 @@ const usePrinterStore = create(
                     : movement.type === 'safe_drop'
                         ? 'SAFE DROP TRANSFER'
                         : movement.type === 'float_topup'
-                            ? 'FLOAT TOP-UP'
+                            ? 'CASH TOP-UP'
                             : isOut
                                 ? 'CASH OUT / EXPENSE'
                                 : 'CASH IN / DEPOSIT';

@@ -54,6 +54,10 @@ return [
         'product.delete',
         'product.stock_adjust',
 
+        // Inventory file import / export (Excel, CSV, PDF)
+        'inventory.import',
+        'inventory.export',
+
         // Store Management
         'store.settings.update',
         'store.receipt_settings.update',

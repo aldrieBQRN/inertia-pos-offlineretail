@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Sale;
 use App\Models\Product;
+use App\Support\Quantity;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
@@ -103,11 +104,19 @@ class TransactionController extends Controller
                 return response()->json(['message' => 'Transaction is already void.'], 400);
             }
 
-            // Restore stock for each item in the transaction
+            // Restore stock for each item in the transaction. Multi-UOM sales
+            // restore the frozen base quantity, never the selling-unit quantity.
+            $stockReturns = [];
             foreach ($sale->items as $item) {
                 $product = Product::find($item->product_id);
                 if ($product) {
-                    $product->increment('stock_quantity', $item->quantity);
+                    $quantityToRestore = $item->base_quantity !== null
+                        ? $item->base_quantity
+                        : $item->quantity;
+                    $oldStock = Quantity::normalize($product->getRawOriginal('stock_quantity'));
+                    $newStock = Quantity::add($oldStock, $quantityToRestore);
+                    $product->update(['stock_quantity' => $newStock]);
+                    $stockReturns[] = [$product, $item, $quantityToRestore, $oldStock, $newStock];
                 }
             }
 
@@ -122,6 +131,32 @@ class TransactionController extends Controller
                 ->exists();
 
             if (!$alreadyLogged) {
+                // One stock movement per returned item so each product's stock ledger reconciles
+                foreach ($stockReturns as [$product, $item, $qty, $oldStock, $newStock]) {
+                    $isMulti = $product->selling_method === Product::SELLING_METHOD_MULTIPLE;
+                    $unitLabel = $isMulti ? ' ' . ($product->base_unit ?: 'units') : '';
+                    $oldNumber = Quantity::toNumber($oldStock);
+                    $newNumber = Quantity::toNumber($newStock);
+                    \App\Services\ActivityService::log(
+                        'product.stock_adjust',
+                        'stock_void_return',
+                        'Product',
+                        $product->id,
+                        "Sale voided ({$sale->invoice_number}): returned "
+                            . \App\Services\InventoryLedgerService::saleQuantityText($item, $product)
+                            . " of {$product->name} (Stock: {$oldNumber} → {$newNumber}{$unitLabel})",
+                        ['stock_quantity' => $oldNumber, 'quantity_added' => 0],
+                        array_filter([
+                            'stock_quantity' => $newNumber,
+                            'quantity_added' => Quantity::toNumber($qty),
+                            'quantity_change' => Quantity::toNumber($qty),
+                            'unit' => $isMulti ? ($product->base_unit ?: null) : null,
+                            'invoice_number' => $sale->invoice_number,
+                            'store_id' => $sale->store_id,
+                        ], fn ($v) => $v !== null)
+                    );
+                }
+
                 \App\Services\ActivityService::log(
                     'sale.void',
                     'sale_voided',

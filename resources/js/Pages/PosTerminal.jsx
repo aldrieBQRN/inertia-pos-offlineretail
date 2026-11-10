@@ -2,13 +2,37 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import AuthenticatedLayout from '@/Layouts/AuthenticatedLayout';
 import { Head, usePage } from '@inertiajs/react';
 import axios from 'axios';
-import useCartStore from '@/Stores/useCartStore';
+import useCartStore, { cartItemKey } from '@/Stores/useCartStore';
+import { productQtyDecimals, formatProductQty, formatQty, stockUnitLabel, typedDecimals, qtyInputStep, remainingBaseStock, roundQty, isMultiUom, lineAmount } from '@/Utils/quantity';
 import usePrinterStore from '@/Stores/usePrinterStore';
 import CartSidebar from '@/Components/CartSidebar';
 import OpenShiftModal from '@/Components/OpenShiftModal';
 import ShiftModal from '@/Components/ShiftModal';
 import CashMovementModal from '@/Components/CashMovementModal';
 import Swal from 'sweetalert2';
+
+/**
+ * Catalog price for a product card/row, in centavos.
+ * Multiple UOM products have no product-level price: show their default selling
+ * unit's price (wholesale when wholesale mode is on) and that unit's name.
+ */
+const catalogPrice = (product, wholesaleActive) => {
+    if (isMultiUom(product)) {
+        const units = product.units || [];
+        const unit = units.find(u => u.is_default) || units[0];
+        if (!unit) return { price: null, unitName: null };
+        const price = wholesaleActive && unit.wholesale_price != null ? unit.wholesale_price : unit.price;
+        return { price, unitName: unit.name };
+    }
+    const price = wholesaleActive && product.wholesale_price !== null && product.wholesale_price !== undefined
+        ? product.wholesale_price
+        : product.price;
+    return { price, unitName: null };
+};
+
+const formatCatalogPrice = (cents) => (cents === null || cents === undefined
+    ? '—'
+    : (cents / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
 
 /**
  * PosTerminal Component
@@ -73,6 +97,9 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
     const [showQtyModal, setShowQtyModal] = useState(false);
     const [qtyModalProduct, setQtyModalProduct] = useState(null);
     const [qtyModalInput, setQtyModalInput] = useState('1');
+    const [qtyModalUnitId, setQtyModalUnitId] = useState('');
+    const [qtyModalUnitDropdownOpen, setQtyModalUnitDropdownOpen] = useState(false);
+    const [qtyModalEditKey, setQtyModalEditKey] = useState(null);
     const [isQtyEditMode, setIsQtyEditMode] = useState(false);
     const [productNavIndex, setProductNavIndex] = useState(-1);
     const [heldOrdersNavIndex, setHeldOrdersNavIndex] = useState(-1);
@@ -269,11 +296,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
     useEffect(() => {
         const handlePOSKeys = (e) => {
             if (showQtyModal) {
-                if (e.key === 'Escape') {
-                    e.preventDefault();
-                    closeQtyModal();
-                }
-                return;
+                return; // Handled by dedicated useEffect with capture phase
             }
 
             // Suspend POS shortcuts if ANY modal is open
@@ -529,8 +552,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
             // If an item in the search results is highlighted via arrow keys, select it
             if (productNavIndex !== -1 && productNavIndex < filteredProducts.length) {
                 const selectedProd = filteredProducts[productNavIndex];
-                const inCart = cart.find(item => item.id === selectedProd.id);
-                const remainingStock = selectedProd.stock_quantity - (inCart ? inCart.quantity : 0);
+                const remainingStock = remainingBaseStock(selectedProd, cart);
                 if (remainingStock > 0) {
                     new Audio('/beep.mp3').play().catch(() => {});
                     triggerQtyModal(selectedProd);
@@ -564,14 +586,24 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
         if (!isEdit) {
             window.dispatchEvent(new CustomEvent('reset-cart-nav'));
         }
-        const inCart = cart.find(item => item.id === product.id);
-        const currentQty = inCart ? inCart.quantity : 0;
-        if (!isEdit && currentQty >= product.stock_quantity) {
+        let editKey = null;
+        let inCart = null;
+        if (isEdit) {
+            // product is actually the cart item when editing
+            editKey = cartItemKey(product);
+            inCart = cart.find(item => cartItemKey(item) === editKey);
+        } else {
+            inCart = cart.find(item => item.id === product.id);
+        }
+        if (!isEdit && remainingBaseStock(product, cart) <= 0) {
             Swal.fire({ icon: 'error', title: 'Out of Stock', text: 'Catalog stock limit reached.', toast: true, position: 'top', showConfirmButton: false, timer: 1500 });
             return;
         }
         setQtyModalProduct(product);
-        setQtyModalInput(isEdit ? String(product.quantity) : '1');
+        setQtyModalInput(isEdit ? String(roundQty(product.quantity)) : '1');
+        const defaultUnit = (product.units || []).find((u) => u.is_default) || (product.units || [])[0];
+        setQtyModalUnitId(isEdit ? String(product.product_unit_id || '') : (defaultUnit ? String(defaultUnit.id) : ''));
+        setQtyModalEditKey(editKey);
         setIsQtyEditMode(isEdit);
         setShowQtyModal(true);
         if (searchInputRef.current) searchInputRef.current.blur();
@@ -580,6 +612,9 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
     const closeQtyModal = () => {
         setShowQtyModal(false);
         setQtyModalProduct(null);
+        setQtyModalUnitId('');
+        setQtyModalUnitDropdownOpen(false);
+        setQtyModalEditKey(null);
         setIsQtyEditMode(false);
         setTimeout(() => {
             if (searchInputRef.current && window.innerWidth >= 1024) {
@@ -589,19 +624,100 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
         }, 50);
     };
 
+    // Quantity Modal F-key handler (runs when modal is open, blocks bubbling to main POS)
+    useEffect(() => {
+        if (!showQtyModal) return;
+
+        const handleQtyModalKeys = (e) => {
+            const isFKey = e.key?.match(/^F[1-9]$|^F1[0-2]$/);
+            const shortcutsEnabled = localStorage.getItem('pos_enable_shortcuts') !== 'false';
+            if (isFKey && !shortcutsEnabled) return;
+
+            // F1: Toggle selling unit dropdown (only for multi-UOM products, not in edit mode)
+            if (e.key === 'F1' && !isQtyEditMode && (qtyModalProduct?.units || []).length > 0) {
+                e.preventDefault();
+                e.stopPropagation();
+                setQtyModalUnitDropdownOpen(prev => !prev);
+                return;
+            }
+
+            // Escape: Close modal or dropdown
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                if (qtyModalUnitDropdownOpen) {
+                    setQtyModalUnitDropdownOpen(false);
+                } else {
+                    closeQtyModal();
+                }
+                return;
+            }
+
+            // Arrow keys for dropdown navigation
+            if (qtyModalUnitDropdownOpen && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+                e.preventDefault();
+                e.stopPropagation();
+                const units = qtyModalProduct.units || [];
+                const idx = units.findIndex((u) => String(u.id) === String(qtyModalUnitId));
+                const nextIdx = e.key === 'ArrowDown'
+                    ? (idx + 1) % units.length
+                    : (idx - 1 + units.length) % units.length;
+                if (units[nextIdx]) setQtyModalUnitId(String(units[nextIdx].id));
+                return;
+            }
+
+            // Enter: Select unit and close dropdown
+            if (qtyModalUnitDropdownOpen && e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+                setQtyModalUnitDropdownOpen(false);
+                // Keep focus on quantity input
+                qtyInputRef.current?.focus();
+                return;
+            }
+        };
+
+        window.addEventListener('keydown', handleQtyModalKeys, true); // capture phase to intercept first
+        return () => window.removeEventListener('keydown', handleQtyModalKeys, true);
+    }, [showQtyModal, isQtyEditMode, qtyModalProduct, qtyModalUnitId, qtyModalUnitDropdownOpen, setQtyModalUnitId, setQtyModalUnitDropdownOpen, closeQtyModal]);
+
     const handleConfirmQty = (e) => {
         if (e) e.preventDefault();
-        const qty = parseInt(qtyModalInput, 10);
+        const isUnits = isMultiUom(qtyModalProduct);
+        const qty = parseFloat(qtyModalInput);
         if (isNaN(qty) || qty <= 0) {
             Swal.fire({ icon: 'error', title: 'Invalid Quantity', text: 'Please enter a valid positive number.', toast: true, position: 'top', showConfirmButton: false, timer: 1500 });
             return;
         }
+        // Quantity decimals: standard products are whole; Multiple UOM follow the product setting
+        const allowedDecimals = productQtyDecimals(qtyModalProduct);
+        if (typedDecimals(qtyModalInput) > allowedDecimals) {
+            Swal.fire({
+                icon: 'error',
+                title: 'Invalid Quantity',
+                text: allowedDecimals === 0
+                    ? (isUnits ? `${qtyModalProduct.name} is sold in whole quantities only.` : 'Standard products require whole-number quantities.')
+                    : `${qtyModalProduct.name} allows up to ${allowedDecimals} decimal place${allowedDecimals === 1 ? '' : 's'}.`,
+                toast: true, position: 'top', showConfirmButton: false, timer: 2000
+            });
+            return;
+        }
 
-        if (qty > qtyModalProduct.stock_quantity) {
+        const units = qtyModalProduct.units || [];
+        const selectedUnit = units.find((u) => String(u.id) === String(qtyModalUnitId)) || null;
+        const conversionFactor = selectedUnit ? Number(selectedUnit.conversion_factor) || 1 : 1;
+        const baseQtyRequested = roundQty(qty * conversionFactor);
+        // Stock not already taken by other cart lines of this product (any unit)
+        const editedLine = isQtyEditMode ? cart.find(item => cartItemKey(item) === qtyModalEditKey) : null;
+        const availableBase = isQtyEditMode
+            ? remainingBaseStock(qtyModalProduct, cart, editedLine)
+            : remainingBaseStock(qtyModalProduct, cart);
+
+        if (baseQtyRequested > availableBase) {
             Swal.fire({
                 icon: 'error',
                 title: 'Limit Reached',
-                text: `Only ${qtyModalProduct.stock_quantity} items available in stock.`,
+                text: `Only ${formatProductQty(qtyModalProduct, Math.max(0, availableBase))} ${stockUnitLabel(qtyModalProduct)} available in stock.`,
                 toast: true,
                 position: 'top',
                 showConfirmButton: false,
@@ -609,16 +725,18 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
             });
             return;
         }
-
-        const appliedPrice = (isWholesaleActive && qtyModalProduct.wholesale_price !== null && qtyModalProduct.wholesale_price !== undefined)
-            ? qtyModalProduct.wholesale_price
-            : qtyModalProduct.price;
+        const isWholesale = isWholesaleActive;
+        const appliedPrice = selectedUnit
+            ? (isWholesale && selectedUnit.wholesale_price !== null ? selectedUnit.wholesale_price : selectedUnit.price)
+            : ((isWholesaleActive && qtyModalProduct.wholesale_price !== null && qtyModalProduct.wholesale_price !== undefined)
+                ? qtyModalProduct.wholesale_price
+                : qtyModalProduct.price);
 
         if (isQtyEditMode) {
-            const updatedCart = cart.map(item => item.id === qtyModalProduct.id ? { ...item, quantity: qty } : item);
+            const updatedCart = cart.map(item => cartItemKey(item) === qtyModalEditKey ? { ...item, quantity: qty } : item);
             setCart(updatedCart);
         } else {
-            addToCart(qtyModalProduct, qty, appliedPrice);
+            addToCart(qtyModalProduct, qty, appliedPrice, selectedUnit);
         }
 
         setShowQtyModal(false);
@@ -706,21 +824,29 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                 return;
             }
 
-            // If available stock is less than saved quantity, adjust quantity to max available
-            if (liveProduct.stock_quantity < item.quantity) {
-                adjustedItems.push(`${item.name || 'Product'} (reduced from ${item.quantity} to ${liveProduct.stock_quantity})`);
+            // If available stock is less than the saved base quantity, reduce to the max available
+            const factor = Number(item.conversion_factor) || 1;
+            const savedBase = roundQty((Number(item.quantity) || 0) * factor);
+            if (liveProduct.stock_quantity < savedBase) {
+                const decimals = productQtyDecimals(liveProduct);
+                const maxQty = Math.floor(roundQty(liveProduct.stock_quantity / factor) * 10 ** decimals) / 10 ** decimals;
+                if (maxQty <= 0) {
+                    soldOutItems.push(item.name || 'Unknown Product');
+                    return;
+                }
+                adjustedItems.push(`${item.name || 'Product'} (reduced from ${formatQty(item.quantity)} to ${formatQty(maxQty)}${item.unit_name ? ` ${item.unit_name}` : ''})`);
                 validCart.push({
                     ...item,
                     stock_quantity: liveProduct.stock_quantity,
-                    quantity: liveProduct.stock_quantity,
-                    price: liveProduct.price ?? item.price
+                    quantity: maxQty,
+                    price: item.product_unit_id ? item.price : (liveProduct.price ?? item.price)
                 });
             } else {
-                // Fully in stock
+                // Fully in stock (Multiple UOM lines keep their selling-unit price)
                 validCart.push({
                     ...item,
                     stock_quantity: liveProduct.stock_quantity,
-                    price: liveProduct.price ?? item.price
+                    price: item.product_unit_id ? item.price : (liveProduct.price ?? item.price)
                 });
             }
         });
@@ -869,7 +995,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                     <div className="flex items-center gap-1.5 sm:gap-2 whitespace-nowrap shrink-0">
                                         <span className="font-semibold text-slate-700">Shift #{shiftData.shift.id} Active</span>
                                         <span className="text-slate-300">·</span>
-                                        <span className="text-slate-600 font-mono">Float: {Number(shiftData.starting_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+                                        <span className="text-slate-600 font-mono">Starting Cash: {Number(shiftData.starting_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                         <span className="text-slate-300">·</span>
                                         <span className="text-[#1B3B6A] font-bold font-mono">Drawer: {Number(shiftData.running_expected_cash || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
                                     </div>
@@ -893,7 +1019,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                         setCategoryNavIndex(-1);
                                     }}
                                     disabled={isAnyModalOpen}
-                                    className={`px-2.5 sm:px-3.5 h-[38px] rounded-none border transition-all flex items-center gap-1.5 text-xs sm:text-sm font-bold shadow-2xs cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed outline-none focus:outline-none ${selectedCategory === 'all' ? 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50' : 'bg-[#EFF4F9] text-[#1B3B6A] border-[#CBD7E6] font-extrabold'}`}
+                                    className={`px-2.5 sm:px-3.5 h-11 rounded-none border transition-all flex items-center gap-1.5 text-xs sm:text-sm font-bold shadow-2xs cursor-pointer active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed outline-none focus:outline-none ${selectedCategory === 'all' ? 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50' : 'bg-[#EFF4F9] text-[#1B3B6A] border-[#CBD7E6] font-extrabold'}`}
                                     title={showFKeys ? "Category Filter (F1)" : "Category Filter"}
                                 >
                                     <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4"><path strokeLinecap="round" strokeLinejoin="round" d="M12 3c2.755 0 5.455.232 8.083.678.533.09.917.556.917 1.096v1.044a2.25 2.25 0 01-.659 1.591l-5.432 5.432a2.25 2.25 0 00-.659 1.591v2.927a2.25 2.25 0 01-1.244 2.013L9.75 21v-6.568a2.25 2.25 0 00-.659-1.591L3.659 7.409A2.25 2.25 0 013 5.818V4.774c0-.54.384-1.006.917-1.096A48.32 48.32 0 0112 3z" /></svg>
@@ -950,16 +1076,16 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                             </div>
 
                             <div className="relative flex-1 group">
-                                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                                    <svg className="w-4 h-4 text-slate-400 group-focus-within:text-[#1B3B6A] transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                                <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
+                                    <svg className="w-5 h-5 text-[#1B3B6A]/70 group-focus-within:text-[#1B3B6A] transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                                     </svg>
                                 </div>
                                 <input
                                     ref={searchInputRef}
                                     type="text"
                                     placeholder="Search product or scan barcode..."
-                                    className="w-full pl-9 pr-12 h-[38px] rounded-none bg-white border border-slate-300 hover:border-slate-400 focus:border-[#1B3B6A] focus:ring-2 focus:ring-[#1B3B6A]/15 transition-all outline-none text-xs sm:text-sm font-semibold text-slate-900 placeholder:text-slate-400 placeholder:font-normal shadow-2xs disabled:bg-gray-50 disabled:cursor-not-allowed"
+                                    className="w-full pl-11 pr-12 h-11 rounded-none bg-white border-2 border-[#1B3B6A]/35 hover:border-[#1B3B6A]/60 focus:border-[#1B3B6A] focus:ring-4 focus:ring-[#1B3B6A]/10 transition-all outline-none text-sm sm:text-base font-semibold text-slate-900 placeholder:text-slate-500 placeholder:font-medium shadow-sm disabled:bg-gray-50 disabled:cursor-not-allowed"
                                     value={searchQuery}
                                     onChange={(e) => { setSearchQuery(e.target.value); window.dispatchEvent(new CustomEvent('reset-cart-nav')); }}
                                     onKeyDown={handleSearchKeyDown}
@@ -972,10 +1098,10 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                         <button
                                             type="button"
                                             onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
-                                            className="p-1 text-slate-400 hover:text-slate-600 rounded-none hover:bg-slate-100 transition-colors cursor-pointer"
+                                            className="p-1.5 text-slate-500 hover:text-slate-800 rounded-none hover:bg-slate-100 transition-colors cursor-pointer"
                                             title="Clear search"
                                         >
-                                            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                                             </svg>
                                         </button>
@@ -1102,7 +1228,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                     {/* PRODUCT LIST COLUMN HEADERS — desktop only, list view only */}
                     {productView === 'list' && (
                         <div className="px-4 py-2.5 bg-gray-50/80 border-b border-gray-200/80 shrink-0 hidden lg:block">
-                            <div className="grid grid-cols-[130px_1fr_90px_100px] gap-2 text-gray-500 uppercase text-[10px] font-black tracking-wider whitespace-nowrap">
+                            <div className="grid grid-cols-[160px_1fr_90px_100px] gap-2 text-gray-500 uppercase text-[10px] font-black tracking-wider whitespace-nowrap">
                                 <div>Barcode</div>
                                 <div>Product Name / Category</div>
                                 <div className="text-right">Stock</div>
@@ -1119,7 +1245,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                         }`}
                     >
                         {isLoading ? (
-                            <div className={productView === 'card' ? 'grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-3 xl:grid-cols-4 gap-3' : 'p-3 space-y-2'}>
+                            <div className={productView === 'card' ? 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3' : 'p-3 space-y-2'}>
                                 {Array.from({ length: productView === 'card' ? 8 : 6 }).map((_, i) => (
                                     productView === 'card' ? (
                                         <div key={i} className="bg-white rounded-none border border-gray-200/80 p-3.5 animate-pulse shadow-2xs">
@@ -1151,13 +1277,14 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                             </div>
                         ) : productView === 'card' ? (
                             /* ── CARD VIEW ── */
-                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-2.5 sm:gap-3 pb-20">
+                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-2.5 sm:gap-3 pb-20">
                                 {filteredProducts.map((p, index) => {
                                     const inCart = cart.find(item => item.id === p.id);
-                                    const remainingStock = p.stock_quantity - (inCart ? inCart.quantity : 0);
+                                    const remainingStock = remainingBaseStock(p, cart);
+                                    const remainingLabel = formatProductQty(p, remainingStock);
                                     const isSoldOut = remainingStock <= 0;
                                     const isLowStock = !isSoldOut && remainingStock < 10;
-                                    const appliedPrice = (isWholesaleActive && p.wholesale_price !== null) ? p.wholesale_price : p.price;
+                                    const { price: appliedPrice, unitName: priceUnit } = catalogPrice(p, isWholesaleActive);
                                     const isHighlighted = productNavIndex === index;
 
                                     return (
@@ -1165,7 +1292,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                             key={p.id}
                                             onClick={() => !isSoldOut && triggerQtyModal(p)}
                                             data-catalog-item-index={index}
-                                            className={`bg-white rounded-none border transition-all p-2.5 flex flex-col justify-between group relative overflow-hidden shadow-2xs hover:shadow-md ${
+                                            className={`bg-white rounded-none border transition-all p-3 flex flex-col justify-between group relative overflow-hidden shadow-2xs hover:shadow-md ${
                                                 isSoldOut
                                                     ? 'opacity-50 cursor-not-allowed border-gray-200 bg-gray-50/50'
                                                     : isHighlighted
@@ -1182,51 +1309,60 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                                         <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
                                                     </svg>
                                                 )}
-                                                {/* Top Badges (SKU & Stock) perfectly aligned */}
+                                                {/* Top Badges (SKU only) perfectly aligned */}
                                                 <div className="absolute top-1.5 inset-x-1.5 flex items-center justify-between gap-1 pointer-events-none">
                                                     {p.sku ? (
-                                                        <span className="px-1.5 py-0.5 rounded-none text-[9px] font-bold font-mono bg-white text-slate-700 border border-slate-200 shadow-2xs truncate max-w-[55%] leading-tight pointer-events-auto">
+                                                        <span className="px-1.5 py-0.5 rounded-none text-[11px] font-bold font-mono bg-white text-slate-700 border border-slate-200 shadow-2xs truncate max-w-[80%] leading-tight pointer-events-auto">
                                                             {p.sku}
                                                         </span>
                                                     ) : (
                                                         <span />
                                                     )}
-                                                    <span className={`px-1.5 py-0.5 rounded-none text-[9px] font-bold font-mono shadow-2xs border shrink-0 leading-tight ${
-                                                        isSoldOut
-                                                            ? 'bg-rose-50 text-rose-700 border-rose-200'
-                                                            : isLowStock
-                                                                ? 'bg-amber-50 text-amber-700 border-amber-200'
-                                                                : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                                    }`}>
-                                                        {isSoldOut ? 'Sold Out' : `${remainingStock}`}
-                                                    </span>
+                                                    {isSoldOut ? (
+                                                        <span className="px-1.5 py-0.5 rounded-none text-[11px] font-bold font-mono shadow-2xs border shrink-0 leading-tight bg-rose-50 text-rose-700 border-rose-200">
+                                                            Sold Out
+                                                        </span>
+                                                    ) : (
+                                                        <span />
+                                                    )}
                                                 </div>
+                                                {/* Bottom Right Stock Badge */}
+                                                {!isSoldOut && (
+                                                    <div className="absolute bottom-1.5 left-1.5 pointer-events-none">
+                                                        <span className={`px-2 py-0.5 rounded-none text-xs font-bold font-mono shadow-2xs border shrink-0 leading-tight ${
+                                                            remainingStock < 10 ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                                        }`}>
+                                                            {remainingLabel}{isMultiUom(p) && p.base_unit ? ` ${p.base_unit}` : ''}
+                                                        </span>
+                                                    </div>
+                                                )}
                                             </div>
 
                                             {/* Card Body */}
                                             <div className="flex flex-col flex-1 justify-between min-w-0">
                                                 <div>
-                                                    <div className="h-8 sm:h-9 flex items-start">
-                                                        <h3 className="font-bold text-gray-900 text-xs leading-tight line-clamp-2" title={p.name}>
+                                                    <div className="h-10 flex items-start">
+                                                        <h3 className="font-bold text-gray-900 text-sm leading-snug line-clamp-2" title={p.name}>
                                                             {p.name}
                                                         </h3>
                                                     </div>
-                                                    <div className="h-4 mt-1 flex items-center">
+                                                    <div className="h-5 mt-1 flex items-center gap-1">
                                                         {p.category ? (
-                                                            <span className="inline-flex items-center px-1.5 py-0.2 rounded-none text-[9px] font-bold bg-blue-50 text-blue-700 border border-blue-200/50 truncate max-w-full">
+                                                            <span className="inline-flex items-center px-1.5 py-0.5 rounded-none text-[11px] font-bold bg-blue-50 text-blue-700 border border-blue-200/50 truncate max-w-full">
                                                                 {p.category.name}
                                                             </span>
                                                         ) : (
-                                                            <span className="text-[9px] text-gray-400 font-medium">General</span>
+                                                            <span className="text-[11px] text-gray-400 font-medium">General</span>
                                                         )}
                                                     </div>
                                                 </div>
                                                 <div className="mt-2 pt-1.5 border-t border-gray-100 flex justify-between items-center shrink-0">
-                                                    <span className="font-bold font-mono text-[#1B3B6A] text-xs sm:text-sm">
-                                                        {(appliedPrice / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                    <span className="font-bold font-mono text-[#1B3B6A] text-sm sm:text-base min-w-0 truncate">
+                                                        {formatCatalogPrice(appliedPrice)}
+                                                        {priceUnit && <span className="text-[11px] font-semibold text-gray-500 font-sans"> / {priceUnit}</span>}
                                                     </span>
                                                     {!isSoldOut && (
-                                                        <div className="w-6 h-6 bg-[#EFF4F9] text-[#1B3B6A] rounded-none flex items-center justify-center text-xs font-black group-hover:bg-[#1B3B6A] group-hover:text-white transition-all shadow-2xs">
+                                                        <div className="w-7 h-7 bg-[#EFF4F9] text-[#1B3B6A] rounded-none flex items-center justify-center text-sm font-black group-hover:bg-[#1B3B6A] group-hover:text-white transition-all shadow-2xs">
                                                             +
                                                         </div>
                                                     )}
@@ -1241,9 +1377,10 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                             <div className="flex flex-col divide-y divide-gray-100/80">
                                 {filteredProducts.map((p, index) => {
                                     const inCart = cart.find(item => item.id === p.id);
-                                    const remainingStock = p.stock_quantity - (inCart ? inCart.quantity : 0);
+                                    const remainingStock = remainingBaseStock(p, cart);
+                                    const remainingLabel = formatProductQty(p, remainingStock);
                                     const isSoldOut = remainingStock <= 0;
-                                    const appliedPrice = (isWholesaleActive && p.wholesale_price !== null) ? p.wholesale_price : p.price;
+                                    const { price: appliedPrice, unitName: priceUnit } = catalogPrice(p, isWholesaleActive);
                                     const isHighlighted = productNavIndex === index;
 
                                     return (
@@ -1251,10 +1388,10 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                             key={p.id}
                                             onClick={() => !isSoldOut && triggerQtyModal(p)}
                                             data-catalog-item-index={index}
-                                            className={`px-4 py-3 grid grid-cols-[1fr_90px] lg:grid-cols-[130px_1fr_90px_100px] gap-2 items-center cursor-pointer transition-colors hover:bg-gray-50/80 ${isHighlighted ? 'bg-[#EFF4F9]/70 ring-1 ring-inset ring-[#1B3B6A]/40' : ''} ${isSoldOut ? 'opacity-50 cursor-not-allowed bg-gray-50/50' : ''}`}
+                                            className={`px-4 py-3 grid grid-cols-[1fr_90px] lg:grid-cols-[160px_1fr_90px_100px] gap-2 items-center cursor-pointer transition-colors hover:bg-gray-50/80 ${isHighlighted ? 'bg-[#EFF4F9]/70 ring-1 ring-inset ring-[#1B3B6A]/40' : ''} ${isSoldOut ? 'opacity-50 cursor-not-allowed bg-gray-50/50' : ''}`}
                                         >
                                             {/* Barcode Column */}
-                                            <div className="min-w-0 font-mono text-xs font-bold text-gray-400 select-all hidden lg:block truncate">
+                                            <div className="min-w-0 font-mono text-xs font-bold text-gray-900 select-all hidden lg:block truncate">
                                                 {p.sku || '—'}
                                             </div>
 
@@ -1273,20 +1410,26 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                                 </div>
                                             </div>
 
-                                            {/* Stock Column */}
+                                            {/* Stock Column (inventory unit underneath for Multiple UOM) */}
                                             <div className="text-right hidden lg:block">
                                                 <span className={`text-xs sm:text-sm font-bold ${isSoldOut ? 'text-rose-700 font-black' : remainingStock < 10 ? 'text-amber-700' : 'text-gray-700'}`}>
-                                                    {isSoldOut ? 'Sold Out' : `${remainingStock}`}
+                                                    {isSoldOut ? 'Sold Out' : remainingLabel}
                                                 </span>
+                                                {isMultiUom(p) && p.base_unit && (
+                                                    <div className="text-[10px] font-semibold text-gray-500 leading-tight">{p.base_unit}</div>
+                                                )}
                                             </div>
 
                                             {/* Price Column */}
                                             <div className="text-right">
                                                 <div className="font-bold text-[#1B3B6A] text-xs sm:text-sm font-mono">
-                                                    {(appliedPrice / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                    {formatCatalogPrice(appliedPrice)}
                                                 </div>
+                                                {priceUnit && (
+                                                    <div className="text-[10px] font-semibold text-gray-500 leading-tight">/ {priceUnit}</div>
+                                                )}
                                                 <div className={`lg:hidden text-[10px] font-bold mt-0.5 ${isSoldOut ? 'text-rose-700 font-black' : remainingStock < 10 ? 'text-amber-700' : 'text-gray-500'}`}>
-                                                    {isSoldOut ? 'Sold Out' : `${remainingStock} left`}
+                                                    {isSoldOut ? 'Sold Out' : `${remainingLabel}${isMultiUom(p) && p.base_unit ? ` ${p.base_unit}` : ''} left`}
                                                 </div>
                                             </div>
                                         </div>
@@ -1347,7 +1490,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                     {heldOrders.map((order, index) => {
                                         const isSelected = heldOrdersNavIndex === index;
                                         const itemCount = order.cart_data.reduce((acc, item) => acc + item.quantity, 0);
-                                        const orderTotal = order.cart_data.reduce((acc, item) => acc + (item.price * item.quantity), 0);
+                                        const orderTotal = order.cart_data.reduce((acc, item) => acc + lineAmount(item), 0);
                                         return (
                                             <div
                                                 key={order.id}
@@ -1434,7 +1577,7 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                         ref={qtyModalRef}
                         onClick={(e) => e.stopPropagation()}
                         onMouseDown={(e) => {
-                            const isInteractive = e.target.closest('input, button, a, [role="button"], label');
+                            const isInteractive = e.target.closest('input, button, a, select, [role="button"], label');
                             if (!isInteractive) {
                                 e.preventDefault();
                                 qtyInputRef.current?.focus();
@@ -1467,10 +1610,84 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                             <div className="text-center mb-4 p-3.5 rounded-none bg-[#EFF4F9] border border-[#CBD7E6] shrink-0">
                                 <div className="text-[10px] text-gray-400 uppercase tracking-widest font-black mb-0.5">Item Selected</div>
                                 <div className="text-sm sm:text-base font-black text-gray-900 tracking-tight leading-snug break-words px-2">{qtyModalProduct.name}</div>
-                                <div className="text-xl font-black text-[#1B3B6A] tracking-tight mt-1 font-mono">
-                                    {(((isWholesaleActive && qtyModalProduct.wholesale_price !== null) ? qtyModalProduct.wholesale_price : qtyModalProduct.price) / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                </div>
+                                {(() => {
+                                    const units = qtyModalProduct.units || [];
+                                    const selectedUnit = units.find((u) => String(u.id) === String(qtyModalUnitId));
+                                    if (selectedUnit) {
+                                        const unitPrice = (isWholesaleActive && selectedUnit.wholesale_price != null) ? selectedUnit.wholesale_price : selectedUnit.price;
+                                        return (
+                                            <div className="text-xl font-black text-[#1B3B6A] tracking-tight mt-1 font-mono">
+                                                {(unitPrice / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                                <span className="text-sm font-medium text-gray-500 ml-1">/ {selectedUnit.name}</span>
+                                            </div>
+                                        );
+                                    }
+                                    // Standard product or no unit selected yet
+                                    const fallbackPrice = (isWholesaleActive && qtyModalProduct.wholesale_price !== null) ? qtyModalProduct.wholesale_price : qtyModalProduct.price;
+                                    return (
+                                        <div className="text-xl font-black text-[#1B3B6A] tracking-tight mt-1 font-mono">
+                                            {(fallbackPrice / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                        </div>
+                                    );
+                                })()}
                             </div>
+
+                            {/* Selling Unit Selector (Multiple-UOM) */}
+                            {(qtyModalProduct.selling_method === 'multiple' || !!qtyModalProduct.is_multi_unit) && (qtyModalProduct.units || []).length > 0 && (
+                                <div className="mb-4">
+                                    <label className="block text-[10px] font-black text-gray-500 uppercase tracking-widest mb-1.5 text-left flex items-center gap-2">Selling Unit
+                                        {shortcutsEnabled && (
+                                            <>
+                                                <kbd className="px-1.5 py-0.5 bg-gray-100 border border-gray-300 rounded-none text-[9px] font-mono text-gray-500">F1</kbd>
+                                                <span className="text-[9px] text-gray-400">open unit list</span>
+                                            </>
+                                        )}
+                                    </label>
+                                    <div className="relative">
+                                        <div
+                                            className="w-full flex items-center justify-between px-4 py-2.5 text-sm font-bold text-gray-900 border border-gray-200 rounded-none bg-white cursor-pointer hover:border-[#1B3B6A]/50 focus-within:ring-2 focus-within:ring-[#1B3B6A]/20 focus-within:border-[#1B3B6A]"
+                                            onClick={() => setQtyModalUnitDropdownOpen(prev => !prev)}
+                                        >
+                                            <span>{(() => {
+                                                const units = qtyModalProduct.units || [];
+                                                const selectedUnit = units.find((u) => String(u.id) === String(qtyModalUnitId));
+                                                if (selectedUnit) {
+                                                    return `${selectedUnit.name} (x${Number(selectedUnit.conversion_factor)}) - ${(((isWholesaleActive && selectedUnit.wholesale_price != null) ? selectedUnit.wholesale_price : selectedUnit.price) / 100).toFixed(2)}`;
+                                                }
+                                                return 'Select selling unit...';
+                                            })()}</span>
+                                            <svg className={`w-5 h-5 text-gray-400 shrink-0 transition-transform duration-150 ${qtyModalUnitDropdownOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7"/></svg>
+                                        </div>
+                                        {qtyModalUnitDropdownOpen && (
+                                            <div className="absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-none shadow-xl z-30 max-h-48 overflow-y-auto custom-scrollbar divide-y divide-slate-100 animate-in fade-in zoom-in-95 duration-150">
+                                                {(qtyModalProduct.units || []).map((u) => (
+                                                    <button
+                                                        key={u.id}
+                                                        type="button"
+                                                        onMouseDown={(e) => {
+                                                            e.preventDefault();
+                                                            setQtyModalUnitId(String(u.id));
+                                                            setQtyModalUnitDropdownOpen(false);
+                                                            // Keep focus on quantity input
+                                                            setTimeout(() => qtyInputRef.current?.focus(), 0);
+                                                        }}
+                                                        className={`w-full text-left px-3.5 py-2.5 text-xs transition-colors flex items-center justify-between group cursor-pointer ${
+                                                            String(u.id) === String(qtyModalUnitId)
+                                                                ? 'bg-[#EFF4F9] text-[#1B3B6A]'
+                                                                : 'text-slate-700 hover:bg-slate-50'
+                                                        }`}
+                                                    >
+                                                        <span>{`${u.name} (x${Number(u.conversion_factor)})`}</span>
+                                                        <span className="font-mono text-gray-500">
+                                                            {(((isWholesaleActive && u.wholesale_price != null) ? u.wholesale_price : u.price) / 100).toFixed(2)}
+                                                        </span>
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
 
                             {/* Quantity Input Wrapper */}
                             <div className="bg-white p-4 rounded-none border border-gray-200/80 shadow-2xs flex-1 flex flex-col justify-center">
@@ -1479,7 +1696,8 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                     ref={qtyInputRef}
                                     type="number"
                                     required
-                                    min="1"
+                                    min={qtyInputStep(qtyModalProduct)}
+                                    step={qtyInputStep(qtyModalProduct)}
                                     max={qtyModalProduct.stock_quantity}
                                     value={qtyModalInput}
                                     onChange={(e) => setQtyModalInput(e.target.value)}
@@ -1497,7 +1715,17 @@ export default function PosTerminal({ auth, store_settings, settings, initial_sh
                                 />
                                 {qtyModalProduct.stock_quantity < 99999 && (
                                     <div className="mt-2.5 text-center text-xs font-bold text-gray-400">
-                                        Available in stock: <span className="text-gray-700 font-black">{qtyModalProduct.stock_quantity}</span>
+                                        Available in stock: <span className="text-gray-700 font-black">{formatProductQty(qtyModalProduct, qtyModalProduct.stock_quantity)} {isMultiUom(qtyModalProduct) ? stockUnitLabel(qtyModalProduct) : ''}</span>
+                                        {isMultiUom(qtyModalProduct) && (
+                                            <span className="block text-[10px] font-semibold text-gray-400 mt-0.5">
+                                                {productQtyDecimals(qtyModalProduct) === 0 ? 'Whole quantities only' : `Up to ${productQtyDecimals(qtyModalProduct)} decimal place${productQtyDecimals(qtyModalProduct) === 1 ? '' : 's'}`}
+                                            </span>
+                                        )}
+                                    </div>
+                                )}
+                                {(qtyModalProduct.selling_method === 'multiple' || !!qtyModalProduct.is_multi_unit) && (
+                                    <div className="mt-2.5 text-center text-xs font-bold text-indigo-600">
+                                        Equivalent inventory deduction: {formatQty((parseFloat(qtyModalInput) || 0) * (Number((qtyModalProduct.units || []).find((u) => String(u.id) === String(qtyModalUnitId))?.conversion_factor) || 1), 6)} {qtyModalProduct.base_unit}
                                     </div>
                                 )}
                             </div>
